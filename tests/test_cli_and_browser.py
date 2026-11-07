@@ -1,6 +1,7 @@
 import json
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -8,15 +9,20 @@ import pytest
 from google_ai_history.cli import main as cli_main
 from google_ai_history.importers import (
     _detect_url_surface_and_id,
+    _launch_chrome_visible,
     fetch_chat_from_url,
     find_chrome_executable,
     sync_from_browser,
 )
 
 
-def test_find_chrome_executable() -> None:
+def test_find_chrome_executable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     res = find_chrome_executable()
     assert res is None or isinstance(res, str)
+    called: list[Any] = []
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: called.append((a, kw)))
+    _launch_chrome_visible("chrome", tmp_path, "https://gemini.google.com/app")
+    assert len(called) == 1
 
 
 def test_detect_url_surface_and_id() -> None:
@@ -89,6 +95,7 @@ async def test_fetch_chat_from_url_mocked(tmp_path: Path) -> None:
     mock_page.evaluate = AsyncMock(
         side_effect=[
             True,  # logged_in check
+            True,  # has_turns check
             None,  # scroll top
             {
                 "pageTitle": "SaaS Billing Idea",

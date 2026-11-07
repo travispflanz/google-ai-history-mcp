@@ -821,7 +821,7 @@ async def _sync_myactivity_page(
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(2.5)
             cards = await page.evaluate(
-                """(maxItems) => {
+                r"""(maxItems) => {
                     const out = [];
                     const els = document.querySelectorAll(
                         'c-wiz [role="listitem"], [data-date] [ role="region" ], article'
