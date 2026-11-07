@@ -93,7 +93,7 @@ def upsert_chat(
     title = (title or "Untitled Google AI Chat").strip()
 
     safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", chat_id)
-    md_filename = f"{slugify(title)}_{safe_id[:16]}.md"
+    md_filename = f"{slugify(title)}_{safe_id[-16:]}.md"
     md_path = paths["markdown"] / md_filename
 
     md_lines = [

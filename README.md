@@ -51,12 +51,35 @@ Google stores your AI interactions across **one central activity hub (`myactivit
 
 | MCP Tool Name | Parameters | What It Does |
 | :--- | :--- | :--- |
-| `fetch_google_ai_chat_url` | `url`, `login_timeout_sec=180` | **Drop-a-URL tool**: Pulls any single Google AI chat/session directly from its URL, saves it locally, and returns the full transcript so you can continue the chat or build a project from it. |
-| `get_google_ai_chat` | `chat_id_or_url`, `login_timeout_sec=180` | Retrieves the full multi-turn conversation transcript and local `.md` file path by ID, partial title, or URL (automatically fetches live if the URL isn't cached yet). |
+| `fetch_google_ai_chat_url` | `url`, `login_timeout_sec=45` | **Drop-a-URL tool**: Pulls any single Google AI chat/session directly from its URL, saves it locally, and returns the full transcript so you can continue the chat or build a project from it. |
+| `get_google_ai_chat` | `chat_id`, `login_timeout_sec=45` | Retrieves the full multi-turn conversation transcript and local `.md` file path by ID, partial title, or URL (automatically fetches live if the URL isn't cached yet). |
 | `search_google_ai_chats` | `query`, `limit=20` | Runs a fast SQLite FTS5 full-text search across all prompts and responses with highlighted snippets. |
 | `list_google_ai_chats` | `limit=50`, `offset=0`, `source=None` | Lists locally synced/imported Google AI chats (optionally filtered by `source`). |
 | `sync_google_ai_chats_from_browser` | `target="gemini"`, `max_chats=50`, `login_timeout_sec=180` | Attaches to Chrome over CDP (`port 9222`) and bulk-syncs threads from `'all'`, `'myactivity'`, `'gemini'`, `'aimode'`, `'aistudio'`, or `'notebooklm'`. |
 | `import_google_ai_takeout_or_files` | `path` | Imports a Google Takeout `.zip`, `MyActivity.json`, `MyActivity.html`, a `Google AI Studio` Drive folder, or exported JSON/Markdown files. |
+
+---
+
+## System Requirements & Expected First-Run Process (For Humans & AI Agents)
+
+### Additional Requirements (Beyond Google Antigravity)
+To run `google-ai-history-mcp` on your computer, you need:
+1. **Google Chrome** or **Microsoft Edge** installed locally (used via Playwright over Chrome DevTools Protocol on `127.0.0.1:9222` for live URL fetching and browser syncing; not required for offline Takeout/Drive imports).
+2. **`uv`** ([Astral uv](https://docs.astral.sh/uv/)) and **Python 3.11+ (`3.11`, `3.12`, or `3.13`)**.
+3. **A Google Account** signed into your Google AI surfaces (`gemini.google.com`, `myactivity.google.com`, `aistudio.google.com`, etc.) — *except when importing public `gemini.google.com/share/...` links or offline Takeout files, which require no login.*
+
+### Expected Process: How First-Run Sign-In & Persistent Sync Works
+Even if you are already signed into Google in your normal everyday Chrome window, **Google Chrome v136+ blocks external debugging connections (`--remote-debugging-port`) on your default Chrome profile** while Chrome is open. To keep your main browser safe and untouched, `google-ai-history-mcp` manages a dedicated, persistent Chrome sync profile at `~/.gemini/google_ai_history/chrome_profile`:
+
+1. **First Run (One-Time Google Sign-In)**:
+   - The first time you ask Antigravity to import a URL or sync your history, `google-ai-history-mcp` launches a visible Chrome window on your desktop (`--remote-debugging-port=9222 --user-data-dir=~/.gemini/google_ai_history/chrome_profile`) and automatically clicks the **"Sign in"** button if you aren't logged into that profile yet.
+   - Sign into your Google account **once** in that Chrome window.
+   - As soon as sign-in finishes, `google-ai-history-mcp` automatically navigates back to your exact target URL (e.g., `https://gemini.google.com/app/<id>`), waits for the conversation turns to render, extracts the full chat, writes the Markdown file to `~/.gemini/google_ai_history/markdown/`, and indexes it in `~/.gemini/google_ai_history/chats.db`.
+2. **All Subsequent Runs (Zero Sign-In Needed)**:
+   - Because your login cookies are persisted inside `~/.gemini/google_ai_history/chrome_profile`, every future URL drop or sync reuses that authenticated session automatically without asking you to log in again.
+3. **Critical Execution Rule for AI Agents (Antigravity, Claude Code, Cursor)**:
+   - **Always invoke the MCP tools (`fetch_google_ai_chat_url`, `get_google_ai_chat`, `sync_google_ai_chats_from_browser`) directly** instead of running the CLI via a sandboxed shell command (`run_command`).
+   - *Why?* On Windows, agent shell sandboxes often execute inside an isolated background desktop (`WinSta0\exebox-...`), which hides any GUI browser window spawned from the shell. By contrast, the MCP server process runs on the user's interactive desktop (`WinSta0\Default`), ensuring the Chrome window is always visible when a one-time login is needed.
 
 ---
 

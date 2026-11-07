@@ -557,7 +557,12 @@ async def _sync_gemini_app_page(
                             const tag = node.tagName.toLowerCase();
                             const roleAttr = node.getAttribute('data-message-author-role');
                             if (tag === 'user-query' || roleAttr === 'user') {
-                                const txt = (node.innerText || '').trim();
+                                const qEl = node.querySelector(
+                                    '.query-text, .user-query-text'
+                                ) || node;
+                                const txt = (qEl.innerText || '')
+                                    .replace(/^You said\\s*\\n*/i, '')
+                                    .trim();
                                 if (txt) messages.push({ role: 'user', content: txt });
                             } else if (tag === 'model-response' || roleAttr === 'model') {
                                 const md = node.querySelector(
@@ -571,9 +576,12 @@ async def _sync_gemini_app_page(
                     const titleEl = document.querySelector(
                         '[data-test-id="conversation-title"], .conversation-title'
                     );
-                    const pageTitle = (titleEl?.innerText || document.title || '')
+                    let pageTitle = (titleEl?.innerText || document.title || '')
                         .replace(/^Gemini\\s*[-–—]\\s*/i, '')
                         .trim();
+                    if (/^(Google Gemini|Conversation with Gemini|Gemini)$/i.test(pageTitle)) {
+                        pageTitle = '';
+                    }
                     return { pageTitle, messages };
                 }"""
             )
@@ -818,14 +826,22 @@ async def _sync_myactivity_page(
                     const els = document.querySelectorAll(
                         'c-wiz [role="listitem"], [data-date] [ role="region" ], article'
                     );
+                    const badges = /^(Gemini Apps|AI Mode|Search|Google Search|YouTube|Maps)$/i;
                     els.forEach(el => {
                         if (out.length >= maxItems) return;
                         const txt = (el.innerText || '').trim();
-                        if (txt && /prompted|asked|ai mode|gemini/i.test(txt)) {
-                            const lines = txt.split('\\n').map(l => l.trim()).filter(Boolean);
+                        if (!txt || /Cleared previous feedback/i.test(txt)) return;
+                        if (/prompted|asked|ai mode|gemini|searched for/i.test(txt)) {
+                            let lines = txt.split('\\n').map(l => l.trim()).filter(Boolean);
+                            while (lines.length > 1 && badges.test(lines[0])) {
+                                lines.shift();
+                            }
+                            const bodyLines = lines.slice(1).filter(
+                                l => !/^\d{1,2}:\d{2}\s*(AM|PM)?\s*•\s*Details$/i.test(l)
+                            );
                             out.push({
                                 title: lines[0] || 'My Activity AI Entry',
-                                body: lines.slice(1).join('\\n')
+                                body: bodyLines.join('\\n')
                             });
                         }
                     });
@@ -835,7 +851,7 @@ async def _sync_myactivity_page(
             )
             for card in cards[:max_chats]:
                 title_clean = re.sub(
-                    r"^(Prompted|Asked in AI Mode|Asked)\s*:?\s*",
+                    r"^(Prompted|Asked in AI Mode|Asked|Searched for)\s*:?\s*",
                     "",
                     card["title"],
                     flags=re.IGNORECASE,
@@ -923,24 +939,27 @@ async def sync_from_browser(
 
         deadline = time.time() + login_timeout_sec
         logged_in = False
+        clicked_sign_in = False
         while time.time() < deadline:
             url = page.url
             if "accounts.google.com" not in url and "google.com" in url:
                 has_chat_ui = await page.evaluate(
-                    """() => {
-                        const signInBtn = Array.from(document.querySelectorAll('a, button')).find(
+                    """(autoClick) => {
+                        const btns = Array.from(document.querySelectorAll('a, button'));
+                        const signInBtn = btns.find(
                             el => /^sign in$/i.test((el.innerText || '').trim())
                         );
-                        const hasInputOrSidebar = !!(
-                            document.querySelector(
-                                'rich-textarea, textarea, [contenteditable="true"], ' +
-                                'conversations-list, [data-test-id*="conversation"], main'
-                            )
-                        );
-                        return !signInBtn && hasInputOrSidebar;
-                    }"""
+                        if (signInBtn && autoClick) {
+                            signInBtn.click();
+                            return false;
+                        }
+                        return !signInBtn && !!document.body;
+                    }""",
+                    not clicked_sign_in,
                 )
-                if has_chat_ui:
+                if not has_chat_ui:
+                    clicked_sign_in = True
+                else:
                     logged_in = True
                     break
             await asyncio.sleep(2.0)
@@ -1125,7 +1144,12 @@ async def fetch_chat_from_url(
                         const tag = node.tagName.toLowerCase();
                         const roleAttr = node.getAttribute('data-message-author-role');
                         if (tag === 'user-query' || roleAttr === 'user') {
-                            const txt = (node.innerText || '').trim();
+                            const qEl = node.querySelector(
+                                '.query-text, .user-query-text'
+                            ) || node;
+                            const txt = (qEl.innerText || '')
+                                .replace(/^You said\\s*\\n*/i, '')
+                                .trim();
                             if (txt) messages.push({ role: 'user', content: txt });
                         } else if (tag === 'model-response' || roleAttr === 'model') {
                             const md = node.querySelector(
@@ -1162,10 +1186,13 @@ async def fetch_chat_from_url(
                 const titleEl = document.querySelector(
                     '[data-test-id="conversation-title"], .conversation-title, h1'
                 );
-                const pageTitle = (titleEl?.innerText || document.title || 'Google AI Session')
+                let pageTitle = (titleEl?.innerText || document.title || '')
                     .replace(/^Gemini\\s*[-–—]\\s*/i, '')
                     .trim();
-                return { pageTitle, messages };
+                if (/^(Google Gemini|Conversation with Gemini|Gemini)$/i.test(pageTitle)) {
+                    pageTitle = messages[0]?.content?.split('\\n')[0]?.slice(0, 80) || '';
+                }
+                return { pageTitle: pageTitle || 'Google AI Session', messages };
             }"""
         )
 

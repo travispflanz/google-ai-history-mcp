@@ -15,9 +15,14 @@
 5. **NotebookLM (`notebooklm.google.com`)**: Research notebooks, source summaries, and Q&A notes.
 
 ## MCP Tools
-- `fetch_google_ai_chat_url(url, login_timeout_sec=180)`: Pulls any single Google AI chat/session directly from a URL so you can continue the chat or build a project from it in Antigravity.
-- `get_google_ai_chat(chat_id_or_url, login_timeout_sec=180)`: Retrieves a conversation by local ID, title, or live URL.
+- `fetch_google_ai_chat_url(url, login_timeout_sec=45)`: Pulls any single Google AI chat/session directly from a URL so you can continue the chat or build a project from it in Antigravity.
+- `get_google_ai_chat(chat_id, login_timeout_sec=45)`: Retrieves a conversation by local ID, title, or live URL.
 - `search_google_ai_chats(query, limit=20)`: Full-text SQLite FTS5 search across all synced Google AI chats.
 - `list_google_ai_chats(limit=50, offset=0, source=None)`: Lists locally indexed Google AI conversations.
 - `sync_google_ai_chats_from_browser(target, max_chats=50, login_timeout_sec=180)`: Bulk syncs `'all'`, `'myactivity'`, `'gemini'`, `'aimode'`, `'aistudio'`, or `'notebooklm'` via Chrome CDP.
 - `import_google_ai_takeout_or_files(path)`: Imports Google Takeout archives, Google Drive `Google AI Studio` folders, or JSON/Markdown exports.
+
+## System Requirements & Operational Rules for AI Agents
+- **Prerequisites**: Requires Google Chrome or Microsoft Edge installed locally, `uv`, and Python 3.11+.
+- **First-Run Chrome Profile Behavior**: Because Chrome v136+ blocks `--remote-debugging-port` on the default Chrome profile, this server launches a dedicated persistent profile at `~/.gemini/google_ai_history/chrome_profile` on port `9222`. On the very first run, it opens a visible Chrome window and auto-clicks "Sign in" so the user can authenticate once; after login, it automatically re-navigates to the requested URL and extracts all turns. All subsequent runs reuse that saved session automatically.
+- **Agent Rule (Use MCP Tools, Not Shell `run_command`)**: AI agents MUST call the MCP tools (`fetch_google_ai_chat_url`, `get_google_ai_chat`, `sync_google_ai_chats_from_browser`) rather than invoking the CLI via a sandboxed shell command (`run_command`). On Windows, sandboxed shell commands run on an isolated hidden desktop (`WinSta0\exebox-...`) where the user cannot see the Chrome window, whereas MCP tools execute on the user's interactive desktop (`WinSta0\Default`).
