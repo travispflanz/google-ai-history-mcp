@@ -33,28 +33,28 @@ def search_google_ai_chats(
 
 @mcp.tool()
 async def get_google_ai_chat(
-    chat_id_or_url: str,
-    login_timeout_sec: int = 180,
+    chat_id: str,
+    login_timeout_sec: int = 45,
 ) -> dict[str, Any]:
     """Retrieve a full Google AI conversation by chat ID, title, or direct URL."""
-    res = get_chat(chat_id=chat_id_or_url)
+    res = get_chat(chat_id=chat_id)
     if res:
         return res
-    if chat_id_or_url.strip().startswith(("http://", "https://")):
+    if chat_id.strip().startswith(("http://", "https://")):
         fetched = await fetch_chat_from_url(
-            url=chat_id_or_url,
+            url=chat_id,
             login_timeout_sec=login_timeout_sec,
         )
         if "chat" in fetched and fetched["chat"]:
             return fetched["chat"]
         return fetched
-    return {"error": f"No chat found matching '{chat_id_or_url}'"}
+    return {"error": f"No chat found matching '{chat_id}'"}
 
 
 @mcp.tool()
 async def fetch_google_ai_chat_url(
     url: str,
-    login_timeout_sec: int = 180,
+    login_timeout_sec: int = 45,
 ) -> dict[str, Any]:
     """Pull a Google AI chat/session directly from a URL to continue or build from it."""
     return await fetch_chat_from_url(url=url, login_timeout_sec=login_timeout_sec)

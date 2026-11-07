@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import zipfile
@@ -860,6 +861,26 @@ async def _sync_myactivity_page(
     return synced
 
 
+def _launch_chrome_visible(chrome_exe: str, profile_dir: Path, start_url: str) -> None:
+    cmd = [
+        chrome_exe,
+        "--remote-debugging-port=9222",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        start_url,
+    ]
+    if sys.platform == "win32":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 1  # SW_SHOWNORMAL
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen(cmd, startupinfo=si, creationflags=creationflags)
+    else:
+        subprocess.Popen(cmd)
+
+
 async def sync_from_browser(
     max_chats: int = 50,
     login_timeout_sec: int = 180,
@@ -883,16 +904,7 @@ async def sync_from_browser(
             chrome_exe = find_chrome_executable()
             if not chrome_exe:
                 return {"error": "Could not find Chrome or Edge executable on this machine."}
-            subprocess.Popen(
-                [
-                    chrome_exe,
-                    "--remote-debugging-port=9222",
-                    f"--user-data-dir={paths['profile']}",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "https://gemini.google.com/app",
-                ]
-            )
+            _launch_chrome_visible(chrome_exe, paths["profile"], "https://gemini.google.com/app")
             for _ in range(30):
                 await asyncio.sleep(1.0)
                 try:
@@ -1016,16 +1028,7 @@ async def fetch_chat_from_url(
             chrome_exe = find_chrome_executable()
             if not chrome_exe:
                 return {"error": "Could not find Chrome or Edge executable on this machine."}
-            subprocess.Popen(
-                [
-                    chrome_exe,
-                    "--remote-debugging-port=9222",
-                    f"--user-data-dir={paths['profile']}",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    clean_url,
-                ]
-            )
+            _launch_chrome_visible(chrome_exe, paths["profile"], clean_url)
             for _ in range(30):
                 await asyncio.sleep(1.0)
                 try:
@@ -1039,25 +1042,37 @@ async def fetch_chat_from_url(
 
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = context.pages[0] if context.pages else await context.new_page()
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
         await page.goto(clean_url, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(2.5)
 
         if not is_public_share:
             deadline = time.time() + login_timeout_sec
             logged_in = False
+            clicked_sign_in = False
             while time.time() < deadline:
                 cur_url = page.url
                 if "accounts.google.com" not in cur_url:
                     has_ui = await page.evaluate(
-                        """() => {
+                        """(autoClick) => {
                             const btns = Array.from(document.querySelectorAll('a, button'));
                             const signInBtn = btns.find(
                                 el => /^sign in$/i.test((el.innerText || '').trim())
                             );
+                            if (signInBtn && autoClick) {
+                                signInBtn.click();
+                                return false;
+                            }
                             return !signInBtn && !!document.body;
-                        }"""
+                        }""",
+                        not clicked_sign_in,
                     )
-                    if has_ui:
+                    if not has_ui:
+                        clicked_sign_in = True
+                    else:
                         logged_in = True
                         break
                 await asyncio.sleep(2.0)
@@ -1070,6 +1085,24 @@ async def fetch_chat_from_url(
                         "and run fetch_google_ai_chat_url again."
                     ),
                 }
+
+            # Re-navigate to clean_url if login flow redirected to generic /app home page
+            if page.url.rstrip("/") != clean_url.rstrip("/"):
+                await page.goto(clean_url, wait_until="domcontentloaded", timeout=30000)
+
+        # Wait up to 12s for SPA conversation turns to render
+        for _ in range(12):
+            has_turns = await page.evaluate(
+                """() => {
+                    return document.querySelectorAll(
+                        'user-query, model-response, [data-message-author-role], ' +
+                        'ms-chat-turn, .chat-turn, [data-turn-role]'
+                    ).length > 0;
+                }"""
+            )
+            if has_turns:
+                break
+            await asyncio.sleep(1.0)
 
         # Scroll up to ensure lazy-loaded earlier turns are rendered
         await page.evaluate(
