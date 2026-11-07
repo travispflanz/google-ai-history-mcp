@@ -655,7 +655,8 @@ async def _sync_search_ai_mode_page(
                 if (/maps\\.google\\.com/i.test(href)) return;
                 const rawTitle = (a.innerText || a.getAttribute('aria-label') || '').trim();
                 const title = rawTitle.split('\\n')[0];
-                if (href && title && title.length > 2 && !/^(Maps|All|Images|Videos)$/i.test(title)) {
+                const navTabs = /^(Maps|All|Images|Videos)$/i;
+                if (href && title && title.length > 2 && !navTabs.test(title)) {
                     out.push({ url: href, title });
                 }
             });
