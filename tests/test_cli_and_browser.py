@@ -35,6 +35,10 @@ def test_detect_url_surface_and_id() -> None:
         == "url_gemini_share"
     )
     assert (
+        _detect_url_surface_and_id("https://share.gemini.google/RknF2GkWxLcp")[0]
+        == "url_gemini_share"
+    )
+    assert (
         _detect_url_surface_and_id("https://aistudio.google.com/prompts/p12345678")[0]
         == "browser_aistudio"
     )

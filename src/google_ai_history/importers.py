@@ -1044,7 +1044,10 @@ async def sync_from_browser(
 def _detect_url_surface_and_id(url: str) -> tuple[str, str]:
     """Classifies a Google AI URL into (source_tag, chat_id)."""
     u = url.strip()
-    m_share = re.search(r"(?:gemini\.google\.com|g\.co/gemini)/share/([a-zA-Z0-9_-]+)", u)
+    m_share = re.search(
+        r"(?:(?:gemini\.google\.com|g\.co/gemini)/share|share\.gemini\.google)/([a-zA-Z0-9_-]+)",
+        u,
+    )
     if m_share:
         return ("url_gemini_share", f"gemini_share_{m_share.group(1)}")
 
@@ -1185,7 +1188,8 @@ async def fetch_chat_from_url(
                 const messages = [];
                 // 1. Gemini App / Share turns
                 const geminiNodes = document.querySelectorAll(
-                    'user-query, model-response, [data-message-author-role]'
+                    'user-query, model-response, share-turn-viewer response-container, ' +
+                    '[data-message-author-role]'
                 );
                 if (geminiNodes.length > 0) {
                     geminiNodes.forEach(node => {
@@ -1196,10 +1200,15 @@ async def fetch_chat_from_url(
                                 '.query-text, .user-query-text'
                             ) || node;
                             const txt = (qEl.innerText || '')
-                                .replace(/^You said\\s*\\n*/i, '')
+                                .replace(/^You said[^\\n]*\\n+/i, '')
+                                .replace(/^You said\\s*/i, '')
                                 .trim();
                             if (txt) messages.push({ role: 'user', content: txt });
-                        } else if (tag === 'model-response' || roleAttr === 'model') {
+                        } else if (
+                            tag === 'model-response' ||
+                            tag === 'response-container' ||
+                            roleAttr === 'model'
+                        ) {
                             const md = node.querySelector(
                                 'message-content, .markdown, .model-response-text'
                             ) || node;
