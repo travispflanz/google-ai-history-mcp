@@ -2,14 +2,14 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from gemini_web_chats.db import get_chat, list_chats, search_chats
-from gemini_web_chats.importers import import_from_path, sync_from_browser
+from google_ai_history.db import get_chat, list_chats, search_chats
+from google_ai_history.importers import import_from_path, sync_from_browser
 
-mcp = FastMCP("gemini-web-chats")
+mcp = FastMCP("google-ai-history")
 
 
 @mcp.tool()
-def list_gemini_web_chats(
+def list_google_ai_chats(
     limit: int = 50,
     offset: int = 0,
     source: str | None = None,
@@ -19,7 +19,7 @@ def list_gemini_web_chats(
 
 
 @mcp.tool()
-def search_gemini_web_chats(
+def search_google_ai_chats(
     query: str,
     limit: int = 20,
 ) -> dict[str, Any]:
@@ -28,7 +28,7 @@ def search_gemini_web_chats(
 
 
 @mcp.tool()
-def get_gemini_web_chat(
+def get_google_ai_chat(
     chat_id: str,
 ) -> dict[str, Any]:
     """Retrieve the full conversation transcript and local Markdown path for a chat ID or title."""
@@ -39,7 +39,7 @@ def get_gemini_web_chat(
 
 
 @mcp.tool()
-def import_gemini_takeout_or_files(
+def import_google_ai_takeout_or_files(
     path: str,
 ) -> dict[str, Any]:
     """Import Google AI chats from Takeout, AI Studio Drive folder, NotebookLM, or JSON/MD."""
@@ -47,12 +47,12 @@ def import_gemini_takeout_or_files(
 
 
 @mcp.tool()
-async def sync_gemini_chats_from_browser(
+async def sync_google_ai_chats_from_browser(
     target: str = "gemini",
     max_chats: int = 50,
     login_timeout_sec: int = 180,
 ) -> dict[str, Any]:
-    """Sync Google AI chats via Chrome ('gemini', 'aimode', 'aistudio', or 'all')."""
+    """Sync Google AI chats via Chrome ('all', 'myactivity', 'gemini', 'aimode', 'aistudio')."""
     return await sync_from_browser(
         max_chats=max_chats,
         login_timeout_sec=login_timeout_sec,

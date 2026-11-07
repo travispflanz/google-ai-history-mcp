@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gemini_web_chats.cli import main as cli_main
-from gemini_web_chats.importers import find_chrome_executable, sync_from_browser
+from google_ai_history.cli import main as cli_main
+from google_ai_history.importers import find_chrome_executable, sync_from_browser
 
 
 def test_find_chrome_executable() -> None:
@@ -19,7 +19,7 @@ def test_cli_import_search_and_list(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setenv("GEMINI_WEB_CHATS_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GOOGLE_AI_HISTORY_DIR", str(tmp_path / "data"))
     export_file = tmp_path / "sample.json"
     export_file.write_text(
         json.dumps(
@@ -35,17 +35,17 @@ def test_cli_import_search_and_list(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(sys, "argv", ["gemini-web-chats", "import", str(export_file)])
+    monkeypatch.setattr(sys, "argv", ["google-ai-history", "import", str(export_file)])
     cli_main()
     out = json.loads(capsys.readouterr().out)
     assert out["imported_count"] == 1
 
-    monkeypatch.setattr(sys, "argv", ["gemini-web-chats", "list"])
+    monkeypatch.setattr(sys, "argv", ["google-ai-history", "list"])
     cli_main()
     listed = json.loads(capsys.readouterr().out)
     assert listed["total_chats"] == 1
 
-    monkeypatch.setattr(sys, "argv", ["gemini-web-chats", "search", "CLI test"])
+    monkeypatch.setattr(sys, "argv", ["google-ai-history", "search", "CLI test"])
     cli_main()
     searched = json.loads(capsys.readouterr().out)
     assert searched["matches"] == 1
@@ -58,12 +58,8 @@ async def test_sync_from_browser_all_targets_mocked(tmp_path: Path) -> None:
 
     mock_page.evaluate = AsyncMock(
         side_effect=[
-            # 1. logged_in check -> True
             True,
-            # --- Target: gemini ---
-            # 2. expand sidebar -> None
             None,
-            # 3. collect sidebar items
             [
                 {
                     "id": "chat99999999",
@@ -71,9 +67,7 @@ async def test_sync_from_browser_all_targets_mocked(tmp_path: Path) -> None:
                     "title": "Mocked Sidebar Chat",
                 }
             ],
-            # 4. scroll conversation container -> None
             None,
-            # 5. extract messages
             {
                 "pageTitle": "Mocked Sidebar Chat",
                 "messages": [
@@ -81,20 +75,14 @@ async def test_sync_from_browser_all_targets_mocked(tmp_path: Path) -> None:
                     {"role": "assistant", "content": "Hello!"},
                 ],
             },
-            # --- Target: aimode ---
-            # 6. open AI mode history drawer
             None,
-            # 7. collect AI mode history links
             [
                 {
                     "url": "https://www.google.com/search?udm=50&q=rust+async",
                     "title": "Rust Async Traits",
                 }
             ],
-            # 8. extract AI mode turns
             [{"role": "assistant", "content": "Async functions in traits are stabilized."}],
-            # --- Target: aistudio ---
-            # 9. collect AI studio library links
             [
                 {
                     "id": "prompt_abc_123",
@@ -102,13 +90,10 @@ async def test_sync_from_browser_all_targets_mocked(tmp_path: Path) -> None:
                     "title": "Prompt Engineering Test",
                 }
             ],
-            # 10. extract AI studio turns
             [
                 {"role": "user", "content": "Test prompt"},
                 {"role": "assistant", "content": "Test model output"},
             ],
-            # --- Target: notebooklm ---
-            # 11. collect NotebookLM links
             [
                 {
                     "id": "nb_xyz_789",
@@ -116,17 +101,13 @@ async def test_sync_from_browser_all_targets_mocked(tmp_path: Path) -> None:
                     "title": "AI Architecture Notebook",
                 }
             ],
-            # 12. extract NotebookLM content
             "Summary of AI architecture sources and notes.",
-            # --- Target: myactivity ---
-            # 13. myactivity gemini cards
             [
                 {
                     "title": "Prompted How does Google My Activity centralize AI logs?",
                     "body": "It stores Gemini, Search AI Mode, Maps, and Assistant logs.",
                 }
             ],
-            # 14. myactivity search_ai cards
             [
                 {
                     "title": "Asked in AI Mode Best local vector database",

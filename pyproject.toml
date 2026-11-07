@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "google-ai-chats-mcp"
+name = "google-ai-history-mcp"
 version = "0.2.0"
 description = "MCP server and CLI tool to sync, import, index (SQLite FTS5), and search all your Google AI interactions (Gemini, Google Search AI Mode, AI Studio, NotebookLM, Ask Maps, YouTube AI, My Activity) in Google Antigravity, Claude Code, and Cursor."
 readme = "README.md"
@@ -13,10 +13,14 @@ authors = [
     { name = "Travis Pflanz" }
 ]
 keywords = [
+    "google-ai",
     "gemini",
     "mcp",
     "model-context-protocol",
     "antigravity",
+    "google-antigravity",
+    "google-ai-studio",
+    "notebooklm",
     "chat-history",
     "google-takeout",
     "playwright",
@@ -38,8 +42,7 @@ dependencies = [
 ]
 
 [project.scripts]
-google-ai-chats = "gemini_web_chats.cli:main"
-gemini-web-chats = "gemini_web_chats.cli:main"
+google-ai-history = "google_ai_history.cli:main"
 
 [dependency-groups]
 dev = [
@@ -51,7 +54,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/gemini_web_chats"]
+packages = ["src/google_ai_history"]
 
 [tool.ruff]
 line-length = 100

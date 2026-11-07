@@ -1,22 +1,22 @@
-# google-ai-history-mcp (Google AI & Gemini Chats Importer for Google Antigravity & MCP)
+# google-ai-history-mcp (Google AI & Gemini Chat History Importer for Google Antigravity & MCP)
 
 > Open-source Model Context Protocol (MCP) server and CLI sync engine that imports, syncs, indexes (SQLite FTS5), and exports all Google AI conversations and interactions into local Markdown files and MCP tools for Google Antigravity, Claude Code, Cursor, Windsurf, and Gemini CLI.
 
 ## What Problem Does This Solve?
 Consumer and developer Google AI conversations are fragmented across multiple web surfaces that do not natively sync with local AI coding agents like **Google Antigravity**:
-1. **Gemini Web App (`gemini.google.com/app`)**: Consumer chat threads stored in the web sidebar and Google Takeout (`My Activity -> Gemini Apps`).
-2. **Google Search "AI Mode" & AI Overviews (`google.com/search?udm=50`)**: Conversational search threads started by clicking "Show more" on an AI Overview and using "Ask anything" in AI Mode.
-3. **Google AI Studio (`aistudio.google.com`)**: Developer prompts, system instructions, thinking traces, and chat histories saved as extensionless JSON files in `Google Drive/Google AI Studio/` and `aistudio.google.com/library`.
-4. **NotebookLM (`notebooklm.google.com`)**: Research notebooks, source summaries, and Q&A notes.
-5. **Google Maps ("Ask Maps"), YouTube ("Ask" Video AI), Circle to Search, Google Lens, and Google Assistant**: Logged under Google's central activity hub (`myactivity.google.com`).
+1. **Central Google My Activity Hub (`myactivity.google.com`)**: Unified chronological log of Gemini Apps, Search AI Mode, Circle to Search, Google Lens, Ask Maps, YouTube AI, and Assistant.
+2. **Gemini Web App (`gemini.google.com/app`)**: Multi-turn consumer chat threads stored in the web sidebar and Google Takeout (`My Activity -> Gemini Apps`).
+3. **Google Search "AI Mode" & AI Overviews (`google.com/search?udm=50`)**: Conversational search threads started by clicking "Show more" on an AI Overview and using "Ask anything" in AI Mode.
+4. **Google AI Studio (`aistudio.google.com`)**: Developer prompts, system instructions, thinking traces, and chat histories saved as extensionless JSON files in `Google Drive/Google AI Studio/` and `aistudio.google.com/library`.
+5. **NotebookLM (`notebooklm.google.com`)**: Research notebooks, source summaries, and Q&A notes.
 
 `google-ai-history-mcp` unifies all of these into:
-- **A fast local SQLite FTS5 full-text search database** (`~/.gemini/gemini_web_chats/chats.db`)
-- **Clean local Markdown files** (`~/.gemini/gemini_web_chats/markdown/*.md`) ready for `@`-mentioning in Google Antigravity
-- **5 MCP tools** (`list_gemini_web_chats`, `search_gemini_web_chats`, `get_gemini_web_chat`, `sync_gemini_chats_from_browser`, `import_gemini_takeout_or_files`)
+- **A fast local SQLite FTS5 full-text search database** (`~/.gemini/google_ai_history/chats.db`)
+- **Clean local Markdown files** (`~/.gemini/google_ai_history/markdown/*.md`) ready for `@`-mentioning in Google Antigravity
+- **5 MCP tools** (`list_google_ai_chats`, `search_google_ai_chats`, `get_google_ai_chat`, `sync_google_ai_chats_from_browser`, `import_google_ai_takeout_or_files`)
 
 ## Key Files
 - [README.md](https://github.com/travispflanz/google-ai-history-mcp/blob/main/README.md): Complete human and AI documentation, setup guide for Google Antigravity, CLI reference, and FAQ.
-- [src/gemini_web_chats/server.py](https://github.com/travispflanz/google-ai-history-mcp/blob/main/src/gemini_web_chats/server.py): FastMCP tool definitions.
-- [src/gemini_web_chats/importers.py](https://github.com/travispflanz/google-ai-history-mcp/blob/main/src/gemini_web_chats/importers.py): Live Chrome CDP Playwright syncers (`gemini`, `aimode`, `aistudio`, `notebooklm`, `myactivity`, `all`) and Google Takeout / Google Drive AI Studio importers.
-- [src/gemini_web_chats/db.py](https://github.com/travispflanz/google-ai-history-mcp/blob/main/src/gemini_web_chats/db.py): SQLite FTS5 indexing engine and Markdown file generator.
+- [src/google_ai_history/server.py](https://github.com/travispflanz/google-ai-history-mcp/blob/main/src/google_ai_history/server.py): FastMCP tool definitions.
+- [src/google_ai_history/importers.py](https://github.com/travispflanz/google-ai-history-mcp/blob/main/src/google_ai_history/importers.py): Live Chrome CDP Playwright syncers (`gemini`, `aimode`, `aistudio`, `notebooklm`, `myactivity`, `all`) and Google Takeout / Google Drive AI Studio importers.
+- [src/google_ai_history/db.py](https://github.com/travispflanz/google-ai-history-mcp/blob/main/src/google_ai_history/db.py): SQLite FTS5 indexing engine and Markdown file generator.

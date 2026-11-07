@@ -10,10 +10,10 @@ from typing import Any
 def get_data_dir(custom_dir: Path | str | None = None) -> Path:
     if custom_dir is not None:
         return Path(custom_dir)
-    env_dir = os.environ.get("GEMINI_WEB_CHATS_DIR")
+    env_dir = os.environ.get("GOOGLE_AI_HISTORY_DIR")
     if env_dir:
         return Path(env_dir)
-    return Path.home() / ".gemini" / "gemini_web_chats"
+    return Path.home() / ".gemini" / "google_ai_history"
 
 
 def ensure_dirs(base_dir: Path | str | None = None) -> dict[str, Path]:
@@ -90,7 +90,7 @@ def upsert_chat(
     now_iso = datetime.now(UTC).isoformat()
     created_at = created_at or now_iso
     updated_at = updated_at or now_iso
-    title = (title or "Untitled Gemini Chat").strip()
+    title = (title or "Untitled Google AI Chat").strip()
 
     safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", chat_id)
     md_filename = f"{slugify(title)}_{safe_id[:16]}.md"

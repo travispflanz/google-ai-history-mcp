@@ -2,8 +2,8 @@ import json
 import zipfile
 from pathlib import Path
 
-from gemini_web_chats.db import get_chat, list_chats, search_chats
-from gemini_web_chats.importers import import_from_path
+from google_ai_history.db import get_chat, list_chats, search_chats
+from google_ai_history.importers import import_from_path
 
 
 def test_import_takeout_multi_surface_and_zip(tmp_path: Path) -> None:
@@ -81,7 +81,6 @@ def test_import_aistudio_and_notebooklm_and_exports(tmp_path: Path) -> None:
     export_dir = tmp_path / "exports"
     export_dir.mkdir()
 
-    # 1. Google AI Studio extensionless file (as saved in Google Drive 'Google AI Studio' folder)
     aistudio_file = export_dir / "System Architecture Prompt"
     aistudio_file.write_text(
         json.dumps(
@@ -104,7 +103,6 @@ def test_import_aistudio_and_notebooklm_and_exports(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    # 2. Google AI Studio contents-style JSON
     aistudio_api_file = export_dir / "api_prompt.prompt"
     aistudio_api_file.write_text(
         json.dumps(
@@ -125,7 +123,6 @@ def test_import_aistudio_and_notebooklm_and_exports(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    # 3. Takeout HTML
     html_file = export_dir / "MyActivity.html"
     html_file.write_text(
         """
@@ -143,7 +140,6 @@ def test_import_aistudio_and_notebooklm_and_exports(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    # 4. Extension JSON export
     ext_json = export_dir / "chat_export.json"
     ext_json.write_text(
         json.dumps(
@@ -159,7 +155,6 @@ def test_import_aistudio_and_notebooklm_and_exports(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    # 5. NotebookLM export
     nb_dir = export_dir / "NotebookLM"
     nb_dir.mkdir()
     nb_file = nb_dir / "Research_Notes.html"

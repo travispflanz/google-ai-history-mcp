@@ -2,24 +2,24 @@ import argparse
 import asyncio
 import json
 
-from gemini_web_chats.db import list_chats, search_chats
-from gemini_web_chats.importers import SUPPORTED_TARGETS, import_from_path, sync_from_browser
-from gemini_web_chats.server import mcp
+from google_ai_history.db import list_chats, search_chats
+from google_ai_history.importers import SUPPORTED_TARGETS, import_from_path, sync_from_browser
+from google_ai_history.server import mcp
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Gemini & Google AI Web Chats MCP Server & CLI")
+    parser = argparse.ArgumentParser(description="Google AI History MCP Server & CLI")
     sub = parser.add_subparsers(dest="cmd")
 
     sync_p = sub.add_parser(
         "sync",
-        help="Sync chats from Gemini, Google Search AI Mode, or AI Studio via Chrome",
+        help="Sync chats from Gemini, Search AI Mode, AI Studio, NotebookLM, or My Activity",
     )
     sync_p.add_argument(
         "--target",
         choices=SUPPORTED_TARGETS,
         default="gemini",
-        help="Which Google AI surface to sync (gemini, aimode, aistudio, all)",
+        help="Google AI surface to sync (gemini, aimode, aistudio, notebooklm, myactivity, all)",
     )
     sync_p.add_argument("--max-chats", type=int, default=50)
     sync_p.add_argument("--timeout", type=int, default=180)
@@ -30,10 +30,10 @@ def main() -> None:
     )
     imp_p.add_argument("path", help="Path to Takeout zip/json/html or Google AI Studio folder")
 
-    search_p = sub.add_parser("search", help="Search local Google AI web chats")
+    search_p = sub.add_parser("search", help="Search local Google AI chats")
     search_p.add_argument("query", help="Search query")
 
-    list_p = sub.add_parser("list", help="List synced Google AI web chats")
+    list_p = sub.add_parser("list", help="List synced Google AI chats")
     list_p.add_argument("--source", default=None, help="Filter by source tag")
 
     sub.add_parser("serve", help="Run the FastMCP stdio server")

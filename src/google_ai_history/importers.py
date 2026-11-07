@@ -13,7 +13,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
-from gemini_web_chats.db import ensure_dirs, upsert_chat
+from google_ai_history.db import ensure_dirs, upsert_chat
 
 SUPPORTED_TARGETS = (
     "gemini",
@@ -938,7 +938,7 @@ async def sync_from_browser(
                 "status": "login_required",
                 "message": (
                     "Please sign into your Google account in the opened Chrome window "
-                    "and run sync_gemini_chats_from_browser again."
+                    "and run sync_google_ai_chats_from_browser again."
                 ),
             }
 

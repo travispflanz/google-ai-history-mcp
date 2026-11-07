@@ -12,7 +12,7 @@
   "packages": [
     {
       "registry_name": "pypi",
-      "name": "google-ai-chats-mcp",
+      "name": "google-ai-history-mcp",
       "version": "0.2.0",
       "runtime_hint": "uvx"
     }

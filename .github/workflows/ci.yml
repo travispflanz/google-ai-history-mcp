@@ -44,4 +44,4 @@ jobs:
         run: uv run mypy src
 
       - name: Run Pytest with Coverage
-        run: uv run pytest --cov=gemini_web_chats --cov-report=term-missing --cov-fail-under=85
+        run: uv run pytest --cov=google_ai_history --cov-report=term-missing --cov-fail-under=85
