@@ -3,13 +3,25 @@ import asyncio
 import json
 
 from google_ai_history.db import list_chats, search_chats
-from google_ai_history.importers import SUPPORTED_TARGETS, import_from_path, sync_from_browser
+from google_ai_history.importers import (
+    SUPPORTED_TARGETS,
+    fetch_chat_from_url,
+    import_from_path,
+    sync_from_browser,
+)
 from google_ai_history.server import mcp
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Google AI History MCP Server & CLI")
     sub = parser.add_subparsers(dest="cmd")
+
+    fetch_p = sub.add_parser(
+        "fetch",
+        help="Fetch a single Google AI chat/session directly from a URL",
+    )
+    fetch_p.add_argument("url", help="Direct or shared URL of the Google AI chat/session")
+    fetch_p.add_argument("--timeout", type=int, default=180)
 
     sync_p = sub.add_parser(
         "sync",
@@ -39,7 +51,10 @@ def main() -> None:
     sub.add_parser("serve", help="Run the FastMCP stdio server")
 
     args = parser.parse_args()
-    if args.cmd == "sync":
+    if args.cmd == "fetch":
+        res = asyncio.run(fetch_chat_from_url(url=args.url, login_timeout_sec=args.timeout))
+        print(json.dumps(res, indent=2))
+    elif args.cmd == "sync":
         res = asyncio.run(
             sync_from_browser(
                 max_chats=args.max_chats,

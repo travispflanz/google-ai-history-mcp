@@ -960,3 +960,197 @@ async def sync_from_browser(
             "synced_count": len([r for r in synced_results if "markdown_path" in r]),
             "synced_chats": synced_results,
         }
+
+
+def _detect_url_surface_and_id(url: str) -> tuple[str, str]:
+    """Classifies a Google AI URL into (source_tag, chat_id)."""
+    u = url.strip()
+    m_share = re.search(r"(?:gemini\.google\.com|g\.co/gemini)/share/([a-zA-Z0-9_-]+)", u)
+    if m_share:
+        return ("url_gemini_share", f"gemini_share_{m_share.group(1)}")
+
+    m_app = re.search(r"gemini\.google\.com/(?:u/\d+/)?app/([a-zA-Z0-9_-]+)", u)
+    if m_app:
+        return ("browser_gemini", m_app.group(1))
+
+    m_ais = re.search(r"aistudio\.google\.com/(?:app/)?prompts/([a-zA-Z0-9_-]+)", u)
+    if m_ais:
+        return ("browser_aistudio", f"aistudio_{m_ais.group(1)}")
+
+    m_nb = re.search(r"notebooklm\.google\.com/notebook/([a-zA-Z0-9_-]+)", u)
+    if m_nb:
+        return ("browser_notebooklm", f"notebooklm_{m_nb.group(1)}")
+
+    if "udm=50" in u or "aimode" in u:
+        cid = hashlib.sha1(u.encode()).hexdigest()[:14]
+        return ("browser_search_ai_mode", f"aimode_{cid}")
+
+    cid = hashlib.sha1(u.encode()).hexdigest()[:14]
+    return ("url_google_ai", f"google_ai_{cid}")
+
+
+async def fetch_chat_from_url(
+    url: str,
+    login_timeout_sec: int = 180,
+    cdp_url: str = "http://127.0.0.1:9222",
+    base_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Navigates to a Google AI chat URL, saves it locally, and returns all turns."""
+    from playwright.async_api import async_playwright
+
+    from google_ai_history.db import get_chat
+
+    clean_url = url.strip()
+    if not clean_url.startswith(("http://", "https://")):
+        return {"error": f"Invalid URL '{url}'. Must start with http:// or https://."}
+
+    source_tag, chat_id = _detect_url_surface_and_id(clean_url)
+    is_public_share = source_tag == "url_gemini_share"
+    paths = ensure_dirs(base_dir)
+
+    async with async_playwright() as p:
+        browser = None
+        try:
+            browser = await p.chromium.connect_over_cdp(cdp_url)
+        except Exception:
+            chrome_exe = find_chrome_executable()
+            if not chrome_exe:
+                return {"error": "Could not find Chrome or Edge executable on this machine."}
+            subprocess.Popen(
+                [
+                    chrome_exe,
+                    "--remote-debugging-port=9222",
+                    f"--user-data-dir={paths['profile']}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    clean_url,
+                ]
+            )
+            for _ in range(30):
+                await asyncio.sleep(1.0)
+                try:
+                    browser = await p.chromium.connect_over_cdp(cdp_url)
+                    break
+                except Exception:
+                    continue
+
+        if not browser:
+            return {"error": "Failed to connect to Chrome over CDP port 9222."}
+
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        page = context.pages[0] if context.pages else await context.new_page()
+        await page.goto(clean_url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2.5)
+
+        if not is_public_share:
+            deadline = time.time() + login_timeout_sec
+            logged_in = False
+            while time.time() < deadline:
+                cur_url = page.url
+                if "accounts.google.com" not in cur_url:
+                    has_ui = await page.evaluate(
+                        """() => {
+                            const btns = Array.from(document.querySelectorAll('a, button'));
+                            const signInBtn = btns.find(
+                                el => /^sign in$/i.test((el.innerText || '').trim())
+                            );
+                            return !signInBtn && !!document.body;
+                        }"""
+                    )
+                    if has_ui:
+                        logged_in = True
+                        break
+                await asyncio.sleep(2.0)
+
+            if not logged_in:
+                return {
+                    "status": "login_required",
+                    "message": (
+                        "Please sign into your Google account in the opened Chrome window "
+                        "and run fetch_google_ai_chat_url again."
+                    ),
+                }
+
+        # Scroll up to ensure lazy-loaded earlier turns are rendered
+        await page.evaluate(
+            """() => {
+                const scroller = document.querySelector('infinite-scroller, main, .chat-history');
+                if (scroller) scroller.scrollTop = 0;
+            }"""
+        )
+        await asyncio.sleep(1.5)
+
+        extracted = await page.evaluate(
+            """() => {
+                const messages = [];
+                // 1. Gemini App / Share turns
+                const geminiNodes = document.querySelectorAll(
+                    'user-query, model-response, [data-message-author-role]'
+                );
+                if (geminiNodes.length > 0) {
+                    geminiNodes.forEach(node => {
+                        const tag = node.tagName.toLowerCase();
+                        const roleAttr = node.getAttribute('data-message-author-role');
+                        if (tag === 'user-query' || roleAttr === 'user') {
+                            const txt = (node.innerText || '').trim();
+                            if (txt) messages.push({ role: 'user', content: txt });
+                        } else if (tag === 'model-response' || roleAttr === 'model') {
+                            const md = node.querySelector(
+                                'message-content, .markdown, .model-response-text'
+                            ) || node;
+                            const txt = (md.innerText || '').trim();
+                            if (txt) messages.push({ role: 'assistant', content: txt });
+                        }
+                    });
+                }
+
+                // 2. AI Studio turns
+                if (messages.length === 0) {
+                    const studioTurns = document.querySelectorAll(
+                        'ms-chat-turn, .chat-turn, [data-turn-role]'
+                    );
+                    studioTurns.forEach(el => {
+                        const roleAttr = (
+                            el.getAttribute('data-turn-role') || el.className || ''
+                        ).toLowerCase();
+                        const role = roleAttr.includes('user') ? 'user' : 'assistant';
+                        const txt = (el.innerText || '').trim();
+                        if (txt) messages.push({ role, content: txt });
+                    });
+                }
+
+                // 3. Fallback for Search AI Mode, NotebookLM, or generic Google AI page
+                if (messages.length === 0) {
+                    const mainEl = document.querySelector('main') || document.body;
+                    const txt = (mainEl?.innerText || '').trim();
+                    if (txt) messages.push({ role: 'assistant', content: txt });
+                }
+
+                const titleEl = document.querySelector(
+                    '[data-test-id="conversation-title"], .conversation-title, h1'
+                );
+                const pageTitle = (titleEl?.innerText || document.title || 'Google AI Session')
+                    .replace(/^Gemini\\s*[-–—]\\s*/i, '')
+                    .trim();
+                return { pageTitle, messages };
+            }"""
+        )
+
+        msgs = extracted.get("messages") or []
+        title = extracted.get("pageTitle") or f"Google AI Chat {chat_id}"
+        if not msgs:
+            return {"error": f"No conversation content could be extracted from {clean_url}"}
+
+        upsert_chat(
+            chat_id=chat_id,
+            title=title[:100],
+            messages=msgs,
+            source=source_tag,
+            url=clean_url,
+            base_dir=base_dir,
+        )
+        full_record = get_chat(chat_id, base_dir=base_dir)
+        return {
+            "status": "ok",
+            "chat": full_record,
+        }

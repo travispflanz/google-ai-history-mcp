@@ -3,7 +3,11 @@ from typing import Any
 from fastmcp import FastMCP
 
 from google_ai_history.db import get_chat, list_chats, search_chats
-from google_ai_history.importers import import_from_path, sync_from_browser
+from google_ai_history.importers import (
+    fetch_chat_from_url,
+    import_from_path,
+    sync_from_browser,
+)
 
 mcp = FastMCP("google-ai-history")
 
@@ -28,14 +32,32 @@ def search_google_ai_chats(
 
 
 @mcp.tool()
-def get_google_ai_chat(
-    chat_id: str,
+async def get_google_ai_chat(
+    chat_id_or_url: str,
+    login_timeout_sec: int = 180,
 ) -> dict[str, Any]:
-    """Retrieve the full conversation transcript and local Markdown path for a chat ID or title."""
-    res = get_chat(chat_id=chat_id)
-    if not res:
-        return {"error": f"No chat found matching '{chat_id}'"}
-    return res
+    """Retrieve a full Google AI conversation by chat ID, title, or direct URL."""
+    res = get_chat(chat_id=chat_id_or_url)
+    if res:
+        return res
+    if chat_id_or_url.strip().startswith(("http://", "https://")):
+        fetched = await fetch_chat_from_url(
+            url=chat_id_or_url,
+            login_timeout_sec=login_timeout_sec,
+        )
+        if "chat" in fetched and fetched["chat"]:
+            return fetched["chat"]
+        return fetched
+    return {"error": f"No chat found matching '{chat_id_or_url}'"}
+
+
+@mcp.tool()
+async def fetch_google_ai_chat_url(
+    url: str,
+    login_timeout_sec: int = 180,
+) -> dict[str, Any]:
+    """Pull a Google AI chat/session directly from a URL to continue or build from it."""
+    return await fetch_chat_from_url(url=url, login_timeout_sec=login_timeout_sec)
 
 
 @mcp.tool()

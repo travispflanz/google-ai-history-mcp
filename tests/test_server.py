@@ -1,9 +1,11 @@
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from google_ai_history.server import (
+    fetch_google_ai_chat_url,
     get_google_ai_chat,
     import_google_ai_takeout_or_files,
     list_google_ai_chats,
@@ -11,7 +13,11 @@ from google_ai_history.server import (
 )
 
 
-def test_mcp_server_tools_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_mcp_server_tools_end_to_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("GOOGLE_AI_HISTORY_DIR", str(tmp_path / "data"))
 
     sample_json = tmp_path / "export.json"
@@ -41,9 +47,28 @@ def test_mcp_server_tools_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyP
     searched = search_google_ai_chats("mcp_config.json")
     assert searched["matches"] == 1
 
-    chat = get_google_ai_chat("server_test_1")
+    chat = await get_google_ai_chat("server_test_1")
     assert chat["title"] == "Antigravity MCP Setup"
     assert len(chat["messages"]) == 2
 
-    missing = get_google_ai_chat("does_not_exist")
+    missing = await get_google_ai_chat("does_not_exist")
     assert "error" in missing
+
+    # Test live URL fallback in get_google_ai_chat & fetch_google_ai_chat_url
+    mock_fetched = {
+        "status": "ok",
+        "chat": {
+            "chat_id": "abc_url_chat",
+            "title": "Continued Project from URL",
+            "messages": [{"role": "user", "content": "Build an API"}],
+        },
+    }
+    with patch(
+        "google_ai_history.server.fetch_chat_from_url",
+        new=AsyncMock(return_value=mock_fetched),
+    ):
+        from_url = await get_google_ai_chat("https://gemini.google.com/app/abc_url_chat")
+        assert from_url["title"] == "Continued Project from URL"
+
+        direct_fetch = await fetch_google_ai_chat_url("https://gemini.google.com/app/abc_url_chat")
+        assert direct_fetch["status"] == "ok"

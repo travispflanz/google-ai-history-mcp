@@ -280,8 +280,8 @@ def get_chat(
     conn = get_conn(base_dir)
     try:
         chat = conn.execute(
-            "SELECT * FROM chats WHERE chat_id = ? OR title LIKE ?",
-            (chat_id, f"%{chat_id}%"),
+            "SELECT * FROM chats WHERE chat_id = ? OR url = ? OR title LIKE ?",
+            (chat_id, chat_id, f"%{chat_id}%"),
         ).fetchone()
         if not chat:
             return None
