@@ -432,20 +432,21 @@ async def _sync_gemini_app_page(
     max_chats: int,
     base_dir: Path | str | None,
 ) -> list[dict[str, Any]]:
-    await page.goto("https://gemini.google.com/app", wait_until="domcontentloaded")
-    await asyncio.sleep(2.0)
+    await page.goto("https://gemini.google.com/search", wait_until="domcontentloaded")
+    await asyncio.sleep(4.0)
 
     await page.evaluate(
         """() => {
-            const menuBtn = document.querySelector(
-                'button[aria-label*="Main menu" i], button[aria-label*="Menu" i], ' +
-                'button[data-test-id="side-nav-menu-button"]'
+            const isOpen = !!document.querySelector(
+                'bard-sidenav.sidenav-open, button[aria-label*="Close sidebar" i], ' +
+                'conversations-list a[href*="/app/"]'
             );
-            const listEl = document.querySelector(
-                'conversations-list, [data-test-id="all-conversations"]'
-            );
-            if (menuBtn && (!listEl || listEl.getBoundingClientRect().width < 40)) {
-                menuBtn.click();
+            if (!isOpen) {
+                const menuBtn = document.querySelector(
+                    'button[aria-label*="Open" i], button[aria-label*="Main menu" i], ' +
+                    'button[data-test-id="side-nav-menu-button"]'
+                );
+                if (menuBtn) menuBtn.click();
             }
         }"""
     )
@@ -454,12 +455,13 @@ async def _sync_gemini_app_page(
     collected_chats: list[dict[str, str]] = []
     seen_ids: set[str] = set()
 
-    for _ in range(25):
+    for attempt in range(25):
         items = await page.evaluate(
             """() => {
                 const out = [];
                 document.querySelectorAll('a[href*="/app/"]').forEach(a => {
                     const href = a.getAttribute('href') || '';
+                    if (/accounts\\.google\\.com|SignOutOptions/i.test(href)) return;
                     const m = href.match(/\\/app\\/([a-zA-Z0-9_-]{8,})/);
                     if (m) {
                         out.push({
@@ -515,7 +517,10 @@ async def _sync_gemini_app_page(
                 );
                 let didScroll = false;
                 scrollers.forEach(s => {
-                    if (s.scrollHeight > s.clientHeight) {
+                    if (
+                        s.scrollHeight > s.clientHeight &&
+                        s.scrollTop + s.clientHeight < s.scrollHeight - 5
+                    ) {
                         s.scrollTop = s.scrollHeight;
                         didScroll = true;
                     }
@@ -524,7 +529,7 @@ async def _sync_gemini_app_page(
             }"""
         )
         await asyncio.sleep(1.5)
-        if not scrolled and new_found == 0:
+        if not scrolled and new_found == 0 and (len(collected_chats) > 0 or attempt >= 4):
             break
 
     synced_results: list[dict[str, Any]] = []
@@ -534,7 +539,7 @@ async def _sync_gemini_app_page(
         title_hint = chat_meta["title"] or f"Gemini Chat {cid}"
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(6.0)
             await page.evaluate(
                 """() => {
                     const scroller = document.querySelector(
@@ -609,10 +614,17 @@ async def _sync_search_ai_mode_page(
 ) -> list[dict[str, Any]]:
     """Scrapes Google Search AI Mode (google.com/search?udm=50 / AI Mode history sidebar)."""
     await page.goto("https://www.google.com/search?udm=50", wait_until="domcontentloaded")
-    await asyncio.sleep(2.5)
+    await asyncio.sleep(3.0)
 
     await page.evaluate(
         """() => {
+            const openBtn = document.querySelector(
+                'button[aria-label="Open sidebar"], a[aria-label="AI Mode history"]'
+            );
+            if (openBtn && !document.querySelector('button[data-thread-id]')) {
+                openBtn.click();
+                return;
+            }
             const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
             const histBtn = nodes.find(
                 el => /history|past searches|recent/i.test(
@@ -622,16 +634,28 @@ async def _sync_search_ai_mode_page(
             if (histBtn) histBtn.click();
         }"""
     )
-    await asyncio.sleep(2.0)
+    await asyncio.sleep(2.5)
 
     threads = await page.evaluate(
         """() => {
             const out = [];
+            document.querySelectorAll('button[data-thread-id]').forEach(btn => {
+                const tid = btn.getAttribute('data-thread-id') || '';
+                const title = (btn.innerText || '').trim().split('\\n')[0];
+                if (tid && title) {
+                    out.push({
+                        url: `https://www.google.com/search?udm=50#thread=${tid}`,
+                        title,
+                        threadId: tid
+                    });
+                }
+            });
             document.querySelectorAll('a[href*="udm=50"], a[href*="aimode"]').forEach(a => {
                 const href = a.href || '';
+                if (/maps\\.google\\.com/i.test(href)) return;
                 const rawTitle = (a.innerText || a.getAttribute('aria-label') || '').trim();
                 const title = rawTitle.split('\\n')[0];
-                if (href && title && title.length > 2) {
+                if (href && title && title.length > 2 && !/^(Maps|All|Images|Videos)$/i.test(title)) {
                     out.push({ url: href, title });
                 }
             });
@@ -649,13 +673,35 @@ async def _sync_search_ai_mode_page(
     synced: list[dict[str, Any]] = []
     for t in unique_threads[:max_chats]:
         try:
-            await page.goto(t["url"], wait_until="domcontentloaded", timeout=20000)
-            await asyncio.sleep(2.5)
+            tid = t.get("threadId")
+            if tid:
+                await page.evaluate(
+                    """(threadId) => {
+                        const openBtn = document.querySelector(
+                            'button[aria-label="Open sidebar"], a[aria-label="AI Mode history"]'
+                        );
+                        let btn = document.querySelector(`button[data-thread-id="${threadId}"]`);
+                        if (!btn && openBtn) {
+                            openBtn.click();
+                        }
+                        btn = document.querySelector(`button[data-thread-id="${threadId}"]`);
+                        if (btn) btn.click();
+                    }""",
+                    tid,
+                )
+            else:
+                await page.goto(t["url"], wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(3.0)
             turns = await page.evaluate(
                 """() => {
                     const messages = [];
-                    const mainEl = document.querySelector('main') || document.body;
-                    const text = (mainEl.innerText || '').trim();
+                    const mainEl = document.querySelector('main, [role="main"]') || document.body;
+                    let text = (mainEl.innerText || '').trim();
+                    const marker = 'AI Mode Conversation:';
+                    const idx = text.indexOf(marker);
+                    if (idx !== -1) {
+                        text = text.slice(idx).trim();
+                    }
                     if (text) {
                         messages.push({ role: 'assistant', content: text });
                     }
@@ -663,14 +709,15 @@ async def _sync_search_ai_mode_page(
                 }"""
             )
             if turns:
-                cid = f"aimode_{hashlib.sha1(t['url'].encode()).hexdigest()[:14]}"
+                real_url = page.url if tid and "udm=50" in page.url else t["url"]
+                cid = f"aimode_{tid or hashlib.sha1(t['url'].encode()).hexdigest()[:14]}"
                 synced.append(
                     upsert_chat(
                         chat_id=cid,
                         title=t["title"][:80],
                         messages=[{"role": "user", "content": t["title"]}, *turns],
                         source="browser_search_ai_mode",
-                        url=t["url"],
+                        url=real_url,
                         base_dir=base_dir,
                     )
                 )
@@ -832,7 +879,7 @@ async def _sync_myactivity_page(
                         const txt = (el.innerText || '').trim();
                         if (!txt || /Cleared previous feedback/i.test(txt)) return;
                         if (/prompted|asked|ai mode|gemini|searched for/i.test(txt)) {
-                            let lines = txt.split('\\n').map(l => l.trim()).filter(Boolean);
+                            let lines = txt.split('\n').map(l => l.trim()).filter(Boolean);
                             while (lines.length > 1 && badges.test(lines[0])) {
                                 lines.shift();
                             }
@@ -841,7 +888,7 @@ async def _sync_myactivity_page(
                             );
                             out.push({
                                 title: lines[0] || 'My Activity AI Entry',
-                                body: bodyLines.join('\\n')
+                                body: bodyLines.join('\n')
                             });
                         }
                     });
@@ -934,7 +981,7 @@ async def sync_from_browser(
 
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = context.pages[0] if context.pages else await context.new_page()
-        if "google.com" not in page.url:
+        if "google.com" not in page.url or "SignOutOptions" in page.url:
             await page.goto("https://gemini.google.com/app", wait_until="domcontentloaded")
 
         deadline = time.time() + login_timeout_sec
@@ -1008,7 +1055,7 @@ def _detect_url_surface_and_id(url: str) -> tuple[str, str]:
     if m_ais:
         return ("browser_aistudio", f"aistudio_{m_ais.group(1)}")
 
-    m_nb = re.search(r"notebooklm\.google\.com/notebook/([a-zA-Z0-9_-]+)", u)
+    m_nb = re.search(r"(?:notebooklm|notebook|gemini)\.google\.com/notebook/([a-zA-Z0-9_-]+)", u)
     if m_nb:
         return ("browser_notebooklm", f"notebooklm_{m_nb.group(1)}")
 
