@@ -52,20 +52,18 @@ def test_cli_import_search_and_list(
 
 
 @pytest.mark.asyncio
-async def test_sync_from_browser_mocked(tmp_path: Path) -> None:
+async def test_sync_from_browser_all_targets_mocked(tmp_path: Path) -> None:
     mock_page = AsyncMock()
     mock_page.url = "https://gemini.google.com/app"
 
-    # Sequence of evaluate return values:
-    # 1. logged_in check -> True
-    # 2. expand sidebar -> None
-    # 3. collect sidebar items (reaches max_chats=1 and breaks)
-    # 4. scroll conversation container -> None
-    # 5. extract messages
     mock_page.evaluate = AsyncMock(
         side_effect=[
+            # 1. logged_in check -> True
             True,
+            # --- Target: gemini ---
+            # 2. expand sidebar -> None
             None,
+            # 3. collect sidebar items
             [
                 {
                     "id": "chat99999999",
@@ -73,7 +71,9 @@ async def test_sync_from_browser_mocked(tmp_path: Path) -> None:
                     "title": "Mocked Sidebar Chat",
                 }
             ],
+            # 4. scroll conversation container -> None
             None,
+            # 5. extract messages
             {
                 "pageTitle": "Mocked Sidebar Chat",
                 "messages": [
@@ -81,6 +81,32 @@ async def test_sync_from_browser_mocked(tmp_path: Path) -> None:
                     {"role": "assistant", "content": "Hello!"},
                 ],
             },
+            # --- Target: aimode ---
+            # 6. open AI mode history drawer
+            None,
+            # 7. collect AI mode history links
+            [
+                {
+                    "url": "https://www.google.com/search?udm=50&q=rust+async",
+                    "title": "Rust Async Traits",
+                }
+            ],
+            # 8. extract AI mode turns
+            [{"role": "assistant", "content": "Async functions in traits are stabilized."}],
+            # --- Target: aistudio ---
+            # 9. collect AI studio library links
+            [
+                {
+                    "id": "prompt_abc_123",
+                    "url": "https://aistudio.google.com/prompts/prompt_abc_123",
+                    "title": "Prompt Engineering Test",
+                }
+            ],
+            # 10. extract AI studio turns
+            [
+                {"role": "user", "content": "Test prompt"},
+                {"role": "assistant", "content": "Test model output"},
+            ],
         ]
     )
 
@@ -98,8 +124,15 @@ async def test_sync_from_browser_mocked(tmp_path: Path) -> None:
     mock_pw_cm.__aexit__ = AsyncMock(return_value=None)
 
     with patch("playwright.async_api.async_playwright", return_value=mock_pw_cm):
-        res = await sync_from_browser(max_chats=1, login_timeout_sec=5, base_dir=tmp_path)
+        res = await sync_from_browser(
+            max_chats=1,
+            login_timeout_sec=5,
+            target="all",
+            base_dir=tmp_path,
+        )
 
     assert res["status"] == "ok"
-    assert res["synced_count"] == 1
-    assert res["synced_chats"][0]["chat_id"] == "chat99999999"
+    assert res["synced_count"] == 3
+
+    bad = await sync_from_browser(target="invalid_target", base_dir=tmp_path)
+    assert "error" in bad

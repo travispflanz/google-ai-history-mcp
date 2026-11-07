@@ -14,7 +14,7 @@ def list_gemini_web_chats(
     offset: int = 0,
     source: str | None = None,
 ) -> dict[str, Any]:
-    """List your imported/synced gemini.google.com conversations stored locally on this computer."""
+    """List locally stored Google AI chats (Gemini, Search AI Mode, AI Studio, Ask Maps, etc.)."""
     return list_chats(limit=limit, offset=offset, source=source)
 
 
@@ -23,7 +23,7 @@ def search_gemini_web_chats(
     query: str,
     limit: int = 20,
 ) -> dict[str, Any]:
-    """Full-text search (SQLite FTS5) across all prompts and responses from gemini.google.com."""
+    """Full-text search (SQLite FTS5) across all synced Google AI prompts and responses."""
     return search_chats(query=query, limit=limit)
 
 
@@ -42,17 +42,19 @@ def get_gemini_web_chat(
 def import_gemini_takeout_or_files(
     path: str,
 ) -> dict[str, Any]:
-    """Import Gemini chats from Takeout (.zip, MyActivity.json, MyActivity.html) or JSON/MD dir."""
+    """Import Google AI chats from Takeout, AI Studio Drive folder, NotebookLM, or JSON/MD."""
     return import_from_path(target_path=path)
 
 
 @mcp.tool()
 async def sync_gemini_chats_from_browser(
+    target: str = "gemini",
     max_chats: int = 50,
     login_timeout_sec: int = 180,
 ) -> dict[str, Any]:
-    """Attach to Chrome, scroll your gemini.google.com sidebar, and sync threads locally."""
+    """Sync Google AI chats via Chrome ('gemini', 'aimode', 'aistudio', or 'all')."""
     return await sync_from_browser(
         max_chats=max_chats,
         login_timeout_sec=login_timeout_sec,
+        target=target,
     )
