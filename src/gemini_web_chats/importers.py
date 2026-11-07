@@ -15,7 +15,14 @@ from bs4 import BeautifulSoup
 
 from gemini_web_chats.db import ensure_dirs, upsert_chat
 
-SUPPORTED_TARGETS = ("gemini", "aimode", "aistudio", "notebooklm", "all")
+SUPPORTED_TARGETS = (
+    "gemini",
+    "aimode",
+    "aistudio",
+    "notebooklm",
+    "myactivity",
+    "all",
+)
 
 
 def clean_html_to_text(html_str: str) -> str:
@@ -35,7 +42,13 @@ def _classify_takeout_source(item: dict[str, Any]) -> str | None:
     if "gemini" in header or "bard" in header or any("gemini" in p for p in products):
         return "takeout_gemini"
 
-    if "ai mode" in header or "ai overview" in title_lower or "asked in ai mode" in title_lower:
+    if (
+        "ai mode" in header
+        or "ai overview" in title_lower
+        or "asked in ai mode" in title_lower
+        or "circle to search" in title_lower
+        or "google lens" in header
+    ):
         return "takeout_search_ai_mode"
 
     if ("maps" in header or "maps" in products) and (
@@ -50,6 +63,10 @@ def _classify_takeout_source(item: dict[str, Any]) -> str | None:
     ):
         return "takeout_youtube_ai"
 
+    if "assistant" in header or "assistant" in products:
+        if title_lower.startswith(("said ", "asked ", "prompted ")):
+            return "takeout_assistant"
+
     if title_lower.startswith("prompted "):
         return "takeout_gemini"
 
@@ -60,7 +77,7 @@ def parse_takeout_json_items(
     items: list[dict[str, Any]],
     base_dir: Path | str | None = None,
 ) -> list[dict[str, Any]]:
-    """Groups Takeout MyActivity.json items (Gemini, Search AI Mode, Ask Maps, YouTube AI)."""
+    """Groups Takeout MyActivity.json items across all Google AI surfaces."""
     parsed_entries: list[dict[str, str]] = []
     for item in items:
         source_tag = _classify_takeout_source(item)
@@ -70,7 +87,7 @@ def parse_takeout_json_items(
         title_raw = str(item.get("title", ""))
         time_str = str(item.get("time", ""))
         prompt = re.sub(
-            r"^(Prompted|Asked in AI Mode|Asked Maps|Asked)\s*:?\s*",
+            r"^(Prompted|Asked in AI Mode|Asked Maps|Asked|Said)\s*:?\s*",
             "",
             title_raw,
             flags=re.IGNORECASE,
@@ -181,7 +198,7 @@ def parse_takeout_html(
     html_text: str,
     base_dir: Path | str | None = None,
 ) -> list[dict[str, Any]]:
-    """Parses Google Takeout MyActivity.html for Gemini Apps, Search AI Mode, and Ask Maps."""
+    """Parses Google Takeout MyActivity.html across Google AI surfaces."""
     soup = BeautifulSoup(html_text, "html.parser")
     cells = soup.select("div.outer-cell")
     items: list[dict[str, Any]] = []
@@ -196,7 +213,7 @@ def parse_takeout_html(
         if not lines:
             continue
         first_line = lines[0]
-        if not re.match(r"^(Prompted|Asked)", first_line, flags=re.IGNORECASE):
+        if not re.match(r"^(Prompted|Asked|Said)", first_line, flags=re.IGNORECASE):
             first_line = f"Prompted {first_line}"
         timestamp = lines[-1] if len(lines) > 1 else ""
         response = "\n".join(lines[1:-1]).strip() if len(lines) > 2 else ""
@@ -229,7 +246,6 @@ def parse_aistudio_json(
         if sys_text.strip():
             messages.append({"role": "system", "content": sys_text.strip()})
 
-    # Format 1: chunkedPrompt.chunks (AI Studio Drive native format)
     chunked = data.get("chunkedPrompt")
     if isinstance(chunked, dict) and isinstance(chunked.get("chunks"), list):
         for chunk in chunked["chunks"]:
@@ -243,7 +259,6 @@ def parse_aistudio_json(
             if text:
                 messages.append({"role": role, "content": text})
 
-    # Format 2: contents array (API / exported prompt format)
     elif isinstance(data.get("contents"), list):
         for content_item in data["contents"]:
             if not isinstance(content_item, dict):
@@ -354,7 +369,6 @@ def import_from_path(
             continue
         ext = f.suffix.lower()
         if ext in (".json", ".prompt", ""):
-            # Note: Google AI Studio saves JSON files in Google Drive WITHOUT a file extension!
             imported_chats.extend(_try_parse_json_file(f, base_dir=base_dir))
         elif ext in (".html", ".htm"):
             html_text = f.read_text(encoding="utf-8", errors="replace")
@@ -588,7 +602,6 @@ async def _sync_search_ai_mode_page(
     await page.goto("https://www.google.com/search?udm=50", wait_until="domcontentloaded")
     await asyncio.sleep(2.5)
 
-    # Open AI Mode history sidebar button if collapsed
     await page.evaluate(
         """() => {
             const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
@@ -632,9 +645,6 @@ async def _sync_search_ai_mode_page(
             turns = await page.evaluate(
                 """() => {
                     const messages = [];
-                    const containers = document.querySelectorAll(
-                        '[data-attrid*="aimode"], [role="heading"], [data-hveid] .WaaZC, main'
-                    );
                     const mainEl = document.querySelector('main') || document.body;
                     const text = (mainEl.innerText || '').trim();
                     if (text) {
@@ -728,6 +738,128 @@ async def _sync_aistudio_page(
     return synced
 
 
+async def _sync_notebooklm_page(
+    page: Any,
+    max_chats: int,
+    base_dir: Path | str | None,
+) -> list[dict[str, Any]]:
+    """Scrapes NotebookLM notebooks and chat notes (notebooklm.google.com)."""
+    await page.goto("https://notebooklm.google.com/", wait_until="domcontentloaded")
+    await asyncio.sleep(3.0)
+
+    notebooks = await page.evaluate(
+        """() => {
+            const out = [];
+            document.querySelectorAll('a[href*="/notebook/"]').forEach(a => {
+                const href = a.href || '';
+                const m = href.match(/\\/notebook\\/([a-zA-Z0-9_-]{6,})/);
+                const title = (a.innerText || '').trim().split('\\n')[0];
+                if (m) {
+                    out.push({ id: m[1], url: href, title: title || `NotebookLM ${m[1]}` });
+                }
+            });
+            return out;
+        }"""
+    )
+
+    seen_ids: set[str] = set()
+    unique_nbs = []
+    for nb in notebooks:
+        if nb["id"] not in seen_ids:
+            seen_ids.add(nb["id"])
+            unique_nbs.append(nb)
+
+    synced: list[dict[str, Any]] = []
+    for nb in unique_nbs[:max_chats]:
+        try:
+            await page.goto(nb["url"], wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(3.0)
+            content = await page.evaluate(
+                """() => {
+                    const mainEl = document.querySelector('main') || document.body;
+                    return (mainEl.innerText || '').trim();
+                }"""
+            )
+            if content:
+                synced.append(
+                    upsert_chat(
+                        chat_id=f"notebooklm_{nb['id']}",
+                        title=nb["title"][:80],
+                        messages=[{"role": "assistant", "content": content}],
+                        source="browser_notebooklm",
+                        url=nb["url"],
+                        base_dir=base_dir,
+                    )
+                )
+        except Exception as exc:
+            synced.append({"chat_id": nb["id"], "error": str(exc)})
+    return synced
+
+
+async def _sync_myactivity_page(
+    page: Any,
+    max_chats: int,
+    base_dir: Path | str | None,
+) -> list[dict[str, Any]]:
+    """Scrapes Google's central My Activity hub (myactivity.google.com/product/gemini & search)."""
+    urls = [
+        ("https://myactivity.google.com/product/gemini", "myactivity_gemini"),
+        ("https://myactivity.google.com/product/search", "myactivity_search_ai"),
+    ]
+    synced: list[dict[str, Any]] = []
+    for url, src_tag in urls:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(2.5)
+            cards = await page.evaluate(
+                """(maxItems) => {
+                    const out = [];
+                    const els = document.querySelectorAll(
+                        'c-wiz [role="listitem"], [data-date] [ role="region" ], article'
+                    );
+                    els.forEach(el => {
+                        if (out.length >= maxItems) return;
+                        const txt = (el.innerText || '').trim();
+                        if (txt && /prompted|asked|ai mode|gemini/i.test(txt)) {
+                            const lines = txt.split('\\n').map(l => l.trim()).filter(Boolean);
+                            out.push({
+                                title: lines[0] || 'My Activity AI Entry',
+                                body: lines.slice(1).join('\\n')
+                            });
+                        }
+                    });
+                    return out;
+                }""",
+                max_chats,
+            )
+            for card in cards[:max_chats]:
+                title_clean = re.sub(
+                    r"^(Prompted|Asked in AI Mode|Asked)\s*:?\s*",
+                    "",
+                    card["title"],
+                    flags=re.IGNORECASE,
+                ).strip()
+                cid_hash = hashlib.sha1(
+                    f"{src_tag}:{title_clean}:{card['body'][:80]}".encode()
+                ).hexdigest()[:14]
+                synced.append(
+                    upsert_chat(
+                        chat_id=f"{src_tag}_{cid_hash}",
+                        title=title_clean[:80] or "Google AI Activity",
+                        messages=[
+                            {"role": "user", "content": title_clean or card["title"]},
+                            {"role": "assistant", "content": card["body"] or "(Activity entry)"},
+                        ],
+                        source=src_tag,
+                        url=url,
+                        base_dir=base_dir,
+                    )
+                )
+        except Exception as exc:
+            synced.append({"url": url, "error": str(exc)})
+    return synced
+
+
 async def sync_from_browser(
     max_chats: int = 50,
     login_timeout_sec: int = 180,
@@ -735,7 +867,7 @@ async def sync_from_browser(
     target: str = "gemini",
     base_dir: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Connects to Chrome over CDP and syncs from Gemini, Search AI Mode, or AI Studio."""
+    """Connects to Chrome over CDP and syncs across Google AI surfaces."""
     from playwright.async_api import async_playwright
 
     if target not in SUPPORTED_TARGETS:
@@ -817,6 +949,10 @@ async def sync_from_browser(
             synced_results.extend(await _sync_search_ai_mode_page(page, max_chats, base_dir))
         if target in ("aistudio", "all"):
             synced_results.extend(await _sync_aistudio_page(page, max_chats, base_dir))
+        if target in ("notebooklm", "all"):
+            synced_results.extend(await _sync_notebooklm_page(page, max_chats, base_dir))
+        if target in ("myactivity", "all"):
+            synced_results.extend(await _sync_myactivity_page(page, max_chats, base_dir))
 
         return {
             "status": "ok",

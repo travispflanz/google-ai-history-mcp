@@ -107,6 +107,32 @@ async def test_sync_from_browser_all_targets_mocked(tmp_path: Path) -> None:
                 {"role": "user", "content": "Test prompt"},
                 {"role": "assistant", "content": "Test model output"},
             ],
+            # --- Target: notebooklm ---
+            # 11. collect NotebookLM links
+            [
+                {
+                    "id": "nb_xyz_789",
+                    "url": "https://notebooklm.google.com/notebook/nb_xyz_789",
+                    "title": "AI Architecture Notebook",
+                }
+            ],
+            # 12. extract NotebookLM content
+            "Summary of AI architecture sources and notes.",
+            # --- Target: myactivity ---
+            # 13. myactivity gemini cards
+            [
+                {
+                    "title": "Prompted How does Google My Activity centralize AI logs?",
+                    "body": "It stores Gemini, Search AI Mode, Maps, and Assistant logs.",
+                }
+            ],
+            # 14. myactivity search_ai cards
+            [
+                {
+                    "title": "Asked in AI Mode Best local vector database",
+                    "body": "SQLite FTS5 and sqlite-vec are great local options.",
+                }
+            ],
         ]
     )
 
@@ -132,7 +158,7 @@ async def test_sync_from_browser_all_targets_mocked(tmp_path: Path) -> None:
         )
 
     assert res["status"] == "ok"
-    assert res["synced_count"] == 3
+    assert res["synced_count"] == 6
 
     bad = await sync_from_browser(target="invalid_target", base_dir=tmp_path)
     assert "error" in bad
