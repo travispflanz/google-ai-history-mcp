@@ -1,0 +1,53 @@
+name: Bug / Google AI DOM Change Report (Human or AI Agent)
+description: Report a bug, missing prerequisite, or Google AI page DOM change discovered by a user or AI coding agent.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve `google-ai-history-mcp`!
+        **Privacy Note (For Humans & AI Agents):** Never include private conversation transcripts, personal email addresses, or private `gemini.google.com/app/<id>` session IDs in issue reports.
+
+  - type: input
+    id: agent_harness
+    attributes:
+      label: AI Agent / Harness & OS Environment
+      description: Which AI agent/IDE and OS encountered this issue?
+      placeholder: "e.g., Google Antigravity / Hermes Agent / Claude Code / Cursor on Windows 11 (Python 3.12)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Google AI Surface / Command Affected
+      options:
+        - "Installation / Dependencies (uv, pip, pyproject.toml)"
+        - "Public Share Link (share.gemini.google / gemini.google.com/share)"
+        - "Gemini Web App (gemini.google.com/app)"
+        - "Google Search AI Mode (google.com/search?udm=50)"
+        - "Google AI Studio (aistudio.google.com)"
+        - "NotebookLM (notebooklm.google.com)"
+        - "Google My Activity Hub (myactivity.google.com)"
+        - "Offline Import (Google Takeout / Google Drive)"
+        - "Other / MCP Server Registration"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor_output
+    attributes:
+      label: Health Check Output (google-ai-history doctor)
+      description: Paste the sanitized output of `google-ai-history doctor`
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Error Details, Traceback & Suggested Fix
+      description: Describe what happened, exact error message/traceback, and any workaround or fix the AI agent discovered.
+    validations:
+      required: true

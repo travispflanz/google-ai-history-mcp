@@ -117,3 +117,42 @@ If the user is on a headless machine, cannot use Chrome CDP, or wants to import 
    - Click **Deselect all**.
    - Check **My Activity** (select **JSON** format under *Multiple formats*, and under *All activity data included* select **Gemini Apps**, **Search**, **Maps**, and **YouTube**) and/or **NotebookLM**.
    - Once downloaded, pass the `.zip` path to `import_google_ai_takeout_or_files(path)`.
+
+---
+
+## 5. Automated Issue & PR Reporting When AI Agents Discover Bugs
+
+If you (an AI agent) encounter an unexpected bug, missing dependency, edge case, or Google AI page DOM change while installing or running `google-ai-history-mcp` (and especially if you had to write a workaround during your session):
+
+1. **Sanitize First (Strict Privacy Rule)**:
+   - **NEVER** include the user's private chat text, personal email address, or private `gemini.google.com/app/<id>` session IDs in any issue or PR description.
+   - Include only: your agent harness name & OS/Python version, sanitized output of `google-ai-history doctor`, the exact traceback or selector change, and the fix/workaround you identified.
+2. **Check if the User Is Set Up with GitHub CLI (`gh auth status`)**:
+   - **If `gh auth status` succeeds (GitHub CLI is authenticated)**:
+     - Ask the user for confirmation first:
+       > *"I encountered an issue in `google-ai-history-mcp` (and found a workaround). Since your GitHub CLI (`gh`) is authenticated, would you like me to submit a sanitized GitHub Issue (or Pull Request) to `travispflanz/google-ai-history-mcp` to help improve the MCP?"*
+     - Upon user approval, submit the issue automatically:
+       ```bash
+       gh issue create --repo travispflanz/google-ai-history-mcp \
+         --title "[Agent Report] <concise summary of issue>" \
+         --body "## Environment\n- Agent Harness: <name>\n- OS / Python: <os / python>\n\n## Issue & Traceback\n...\n\n## Suggested Fix / Workaround\n..."
+       ```
+   - **If `gh` is NOT installed or NOT authenticated**:
+     - Do **not** force the user to install or log into GitHub. Simply include a brief note at the end of your response with a copy-pasteable summary and a pre-filled 1-click URL to [`https://github.com/travispflanz/google-ai-history-mcp/issues/new`](https://github.com/travispflanz/google-ai-history-mcp/issues/new) in case they want to report it.
+
+---
+
+## 6. Repository Contribution & Pull Request Workflow
+
+When contributing improvements or fixes to this repository:
+1. **Never push directly to `main`**: Create a descriptive branch (`feat/<name>`, `fix/<name>`, `docs/<name>`).
+2. **Run all local quality gates before opening a PR**:
+   ```bash
+   uv run ruff check .
+   uv run ruff format --check .
+   uv run mypy src
+   uv run pytest --cov=google_ai_history --cov-report=term-missing --cov-fail-under=85
+   ```
+3. **Open a Pull Request & verify CI**:
+   - Push the branch and run `gh pr create --fill`.
+   - Wait for all 6 GitHub Actions CI matrix jobs (`ubuntu-latest` + `windows-latest` across Python `3.11`, `3.12`, `3.13`) to pass before squash-merging (`gh pr merge --squash --delete-branch`).
