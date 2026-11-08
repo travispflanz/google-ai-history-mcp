@@ -7,6 +7,7 @@ import pytest
 from google_ai_history.server import (
     fetch_google_ai_chat_url,
     get_google_ai_chat,
+    google_ai_history_auth_status,
     import_google_ai_takeout_or_files,
     list_google_ai_chats,
     search_google_ai_chats,
@@ -19,6 +20,9 @@ async def test_mcp_server_tools_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("GOOGLE_AI_HISTORY_DIR", str(tmp_path / "data"))
+    auth_stat = google_ai_history_auth_status()
+    assert auth_stat["public_share_links_ready"] is True
+    assert auth_stat["authenticated_surfaces_ready"] is False
 
     sample_json = tmp_path / "export.json"
     sample_json.write_text(

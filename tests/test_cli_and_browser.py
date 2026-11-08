@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -10,8 +11,10 @@ from google_ai_history.cli import main as cli_main
 from google_ai_history.importers import (
     _detect_url_surface_and_id,
     _fetch_public_share_via_http,
+    _harvest_gemini_turns_from_page,
     _launch_chrome_visible,
     _normalize_google_ai_url,
+    _probe_profile_google_cookies,
     _strip_directional_chars,
     check_system_health,
     fetch_chat_from_url,
@@ -101,20 +104,29 @@ async def test_fetch_chat_from_url_mocked(tmp_path: Path) -> None:
 
     mock_page = AsyncMock()
     mock_page.url = "https://gemini.google.com/app/chat_url_123"
-    mock_page.evaluate = AsyncMock(
-        side_effect=[
-            True,  # logged_in check
-            True,  # has_turns check
-            None,  # scroll top
-            {
+
+    def _fake_evaluate(script: Any, *args: Any, **kwargs: Any) -> Any:
+        """Dispatch by script content so the mock survives call-order changes."""
+        s = script if isinstance(script, str) else ""
+        if "pageTitle" in s:
+            return {
                 "pageTitle": "SaaS Billing Idea",
                 "messages": [
                     {"role": "user", "content": "Let's sketch a SaaS billing webhook handler."},
                     {"role": "assistant", "content": "Here is the FastAPI Stripe webhook design."},
                 ],
-            },
-        ]
-    )
+            }
+        if "infinite-scroller.chat-history" in s:
+            return {"top": 0, "height": 0, "client": 0}
+        if "user-query, model-response" in s:
+            return []
+        if "autoClick" in s:
+            return True
+        if "data-message-author-role" in s:
+            return True
+        return None
+
+    mock_page.evaluate = AsyncMock(side_effect=_fake_evaluate)
 
     mock_context = MagicMock()
     mock_context.pages = [mock_page]
@@ -140,6 +152,63 @@ async def test_fetch_chat_from_url_mocked(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_harvest_gemini_turns_and_cookie_probe(tmp_path: Path) -> None:
+    # 1. Test virtualised multi-window scroller harvest
+    scroll_pos = 1000
+    windows = [
+        [
+            {"role": "user", "content": "Opening turn 1"},
+            {"role": "assistant", "content": "Opening response 1"},
+        ],
+        [
+            {"role": "assistant", "content": "Opening response 1"},  # overlap to test dedup
+            {"role": "user", "content": "Closing turn 2"},
+            {"role": "assistant", "content": "Closing response 2"},
+        ],
+    ]
+    win_idx = 0
+
+    async def _eval(script: str, frac: float = 0.0) -> Any:
+        nonlocal scroll_pos, win_idx
+        if "infinite-scroller.chat-history" in script:
+            if frac < 0:
+                scroll_pos = 0
+                return {"top": 0, "height": 1000, "client": 500}
+            scroll_pos += 500
+            return {"top": scroll_pos, "height": 1000, "client": 500}
+        cur = windows[min(win_idx, len(windows) - 1)]
+        win_idx += 1
+        return cur
+
+    mock_page = MagicMock()
+    mock_page.evaluate = AsyncMock(side_effect=_eval)
+    harvested = await _harvest_gemini_turns_from_page(mock_page)
+    assert len(harvested) == 4
+    assert harvested[0]["content"] == "Opening turn 1"
+    assert harvested[-1]["content"] == "Closing response 2"
+
+    # 2. Test SQLite cookie probe (0 when empty, >0 when SID/__Secure-1PSID present)
+    profile_dir = tmp_path / "chrome_profile"
+    assert _probe_profile_google_cookies(profile_dir) == 0
+    net_dir = profile_dir / "Default" / "Network"
+    net_dir.mkdir(parents=True)
+    cookie_db = net_dir / "Cookies"
+    conn = sqlite3.connect(str(cookie_db))
+    conn.execute("CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT)")
+    conn.execute("INSERT INTO cookies VALUES ('.google.com', 'NID', 'anon')")
+    conn.commit()
+    conn.close()
+    assert _probe_profile_google_cookies(profile_dir) == 0
+
+    conn = sqlite3.connect(str(cookie_db))
+    conn.execute("INSERT INTO cookies VALUES ('.google.com', '__Secure-1PSID', 'auth_val')")
+    conn.execute("INSERT INTO cookies VALUES ('.google.com', 'SID', 'sid_val')")
+    conn.commit()
+    conn.close()
+    assert _probe_profile_google_cookies(profile_dir) == 2
+
+
+@pytest.mark.asyncio
 async def test_sync_from_browser_all_targets_mocked(tmp_path: Path) -> None:
     mock_page = AsyncMock()
     mock_page.url = "https://gemini.google.com/app"
@@ -155,7 +224,11 @@ async def test_sync_from_browser_all_targets_mocked(tmp_path: Path) -> None:
                     "title": "Mocked Sidebar Chat",
                 }
             ],
-            None,
+            False,
+            {"top": 0, "height": 0, "client": 0},
+            [],
+            {"top": 0, "height": 0, "client": 0},
+            [],
             {
                 "pageTitle": "Mocked Sidebar Chat",
                 "messages": [

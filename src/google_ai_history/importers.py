@@ -3,6 +3,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -562,19 +564,12 @@ async def _sync_gemini_app_page(
         title_hint = chat_meta["title"] or f"Gemini Chat {cid}"
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            await asyncio.sleep(6.0)
-            await page.evaluate(
-                """() => {
-                    const scroller = document.querySelector(
-                        'infinite-scroller, main, .chat-history'
-                    );
-                    if (scroller) scroller.scrollTop = 0;
-                }"""
-            )
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(4.0)
+            harvested = await _harvest_gemini_turns_from_page(page)
 
-            extracted = await page.evaluate(
-                """() => {
+            extracted = (
+                await page.evaluate(
+                    """() => {
                     const messages = [];
                     const turnNodes = document.querySelectorAll(
                         'user-query, model-response, ' +
@@ -589,14 +584,17 @@ async def _sync_gemini_app_page(
                                     '.query-text, .user-query-text'
                                 ) || node;
                                 const txt = (qEl.innerText || '')
-                                    .replace(/^You said\\s*\\n*/i, '')
+                                    .replace(/^You said[^\\n]*\\n+/i, '')
+                                    .replace(/^You said\\s*/i, '')
                                     .trim();
                                 if (txt) messages.push({ role: 'user', content: txt });
                             } else if (tag === 'model-response' || roleAttr === 'model') {
                                 const md = node.querySelector(
                                     'message-content, .markdown, .model-response-text'
                                 ) || node;
-                                const txt = (md.innerText || '').trim();
+                                const txt = (md.innerText || '')
+                                    .replace(/^Gemini said\\s*/i, '')
+                                    .trim();
                                 if (txt) messages.push({ role: 'assistant', content: txt });
                             }
                         });
@@ -612,9 +610,11 @@ async def _sync_gemini_app_page(
                     }
                     return { pageTitle, messages };
                 }"""
+                )
+                or {}
             )
-            msgs = extracted.get("messages") or []
-            final_title = extracted.get("pageTitle") or title_hint
+            msgs = harvested if harvested else (extracted.get("messages") or [])
+            final_title = _strip_directional_chars(extracted.get("pageTitle") or title_hint)
             if msgs:
                 saved = upsert_chat(
                     chat_id=cid,
@@ -628,6 +628,87 @@ async def _sync_gemini_app_page(
         except Exception as exc:
             synced_results.append({"chat_id": cid, "error": str(exc)})
     return synced_results
+
+
+async def _harvest_gemini_turns_from_page(page: Any) -> list[dict[str, Any]]:
+    """Climbs infinite-scroller.chat-history to top and walks down merging virtualised turns."""
+    harvest_js = """() => {
+        const nodes = Array.from(document.querySelectorAll('user-query, model-response'));
+        const out = [];
+        for (const node of nodes) {
+            const tag = node.tagName.toLowerCase();
+            if (tag === 'user-query') {
+                const el = node.querySelector('.query-text, .user-query-text') || node;
+                let t = (el.innerText || '').trim();
+                t = t.replace(/^You said[^\\n]*\\n+/i, '')
+                     .replace(/^You said\\s*/i, '').trim();
+                if (t) out.push({ role: 'user', content: t });
+            } else {
+                const el = node.querySelector(
+                    'message-content, .markdown, .model-response-text'
+                ) || node;
+                const t = (el.innerText || '').trim()
+                    .replace(/^Gemini said\\s*/i, '').trim();
+                if (t) out.push({ role: 'assistant', content: t });
+            }
+        }
+        return out;
+    }"""
+
+    async def _scroll_chat(frac: float) -> dict[str, Any]:
+        res = await page.evaluate(
+            """(frac) => {
+                const el = document.querySelector('infinite-scroller.chat-history')
+                    || document.querySelector('infinite-scroller');
+                if (!el) return { top: 0, height: 0, client: 0 };
+                el.scrollTop = Math.max(0, el.scrollTop + el.clientHeight * frac);
+                return { top: el.scrollTop, height: el.scrollHeight, client: el.clientHeight };
+            }""",
+            frac,
+        )
+        return res if isinstance(res, dict) else {}
+
+    harvested: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+
+    def _absorb(window: list[dict[str, Any]] | None) -> None:
+        for w in window or []:
+            if not isinstance(w, dict):
+                continue
+            role = str(w.get("role") or "")
+            content = _strip_directional_chars(str(w.get("content") or ""))
+            if not role or not content:
+                continue
+            k = (role, content)
+            if k not in seen_keys:
+                seen_keys.add(k)
+                harvested.append({"role": role, "content": content})
+
+    try:
+        # 1) Climb to the very top so the earliest turns mount first
+        for _ in range(40):
+            info = await _scroll_chat(-1.0)
+            await asyncio.sleep(0.6)
+            if info.get("top", 1) <= 0:
+                break
+        await asyncio.sleep(0.5)
+
+        # 2) Walk downward, merging each rendered window in chronological order
+        prev_top: Any = -1
+        for _ in range(80):
+            _absorb(await page.evaluate(harvest_js))
+            info = await _scroll_chat(0.75)
+            await asyncio.sleep(0.6)
+            at_bottom = info.get("top", 0) + info.get("client", 0) >= info.get("height", 1)
+            if at_bottom:
+                _absorb(await page.evaluate(harvest_js))
+                break
+            if info.get("top") == prev_top:
+                break
+            prev_top = info.get("top")
+    except Exception:
+        pass
+    return harvested
 
 
 async def _sync_search_ai_mode_page(
@@ -1214,11 +1295,44 @@ def _fetch_public_share_via_http(url: str) -> dict[str, Any] | None:
     return None
 
 
+def _probe_profile_google_cookies(profile_dir: Path) -> int:
+    """Counts Google auth cookies (SID, SAPISID, __Secure-1PSID, __Secure-3PSID) in Chrome DB."""
+    candidates = [
+        profile_dir / "Default" / "Network" / "Cookies",
+        profile_dir / "Default" / "Cookies",
+    ]
+    cookie_db = next((p for p in candidates if p.is_file()), None)
+    if not cookie_db:
+        return 0
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir) / "Cookies"
+            shutil.copy2(cookie_db, tmp_path)
+            for suffix in ("-wal", "-shm"):
+                sidecar = cookie_db.with_name(cookie_db.name + suffix)
+                if sidecar.is_file():
+                    shutil.copy2(sidecar, Path(tmpdir) / ("Cookies" + suffix))
+            conn = sqlite3.connect(str(tmp_path))
+            try:
+                cur = conn.execute(
+                    "SELECT COUNT(*) FROM cookies "
+                    "WHERE host_key LIKE '%google.com%' "
+                    "AND name IN ('SID', 'SAPISID', '__Secure-1PSID', '__Secure-3PSID')"
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                conn.close()
+    except Exception:
+        return 0
+
+
 def check_system_health(
     base_dir: Path | str | None = None,
     cdp_url: str = "http://127.0.0.1:9222",
 ) -> dict[str, Any]:
-    """Checks system prerequisites, dependencies, Chrome/CDP status, and profile readiness."""
+    """Checks system prerequisites, dependencies, Chrome/CDP status, and real auth cookie state."""
     paths = ensure_dirs(base_dir)
     py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     py_ok = sys.version_info >= (3, 11)
@@ -1240,9 +1354,9 @@ def check_system_health(
         cdp_active = False
 
     profile_dir = paths["profile"]
-    profile_initialized = (profile_dir / "Local State").exists() or (
-        profile_dir / "Default"
-    ).exists()
+    profile_initialized = (profile_dir / "Default").is_dir()
+    google_auth_cookie_count = _probe_profile_google_cookies(profile_dir)
+    auth_ready = bool(chrome_exe and google_auth_cookie_count > 0)
 
     recommendations: list[str] = []
     if not all(deps.values()):
@@ -1255,9 +1369,10 @@ def check_system_health(
             "Chrome/Edge not found. Public Gemini share links (share.gemini.google/...) still work "
             "via direct HTTP without a browser, but private chats require Chrome or Edge."
         )
-    elif not profile_initialized:
+    elif not auth_ready:
         recommendations.append(
-            "Run 'google-ai-history setup' to open Chrome and sign into Google once."
+            "No Google auth session found in chrome_profile. Run 'google-ai-history setup' "
+            "to open Chrome and sign into Google once for private chats."
         )
 
     return {
@@ -1269,8 +1384,9 @@ def check_system_health(
         "cdp_port_9222_active": cdp_active,
         "profile_dir": str(profile_dir),
         "profile_initialized": profile_initialized,
+        "google_auth_cookie_count": google_auth_cookie_count,
         "public_share_links_ready": True,
-        "authenticated_surfaces_ready": bool(chrome_exe and profile_initialized),
+        "authenticated_surfaces_ready": auth_ready,
         "recommendations": recommendations,
     }
 
@@ -1411,6 +1527,7 @@ async def fetch_chat_from_url(
             if not logged_in:
                 return {
                     "status": "login_required",
+                    "reason": "login_required",
                     "message": (
                         "Authentication required. Please sign into your Google account in the "
                         "opened Chrome window and run 'google-ai-history setup' or retry."
@@ -1436,17 +1553,12 @@ async def fetch_chat_from_url(
                 break
             await asyncio.sleep(1.0)
 
-        # Scroll up to ensure lazy-loaded earlier turns are rendered
-        await page.evaluate(
-            """() => {
-                const scroller = document.querySelector('infinite-scroller, main, .chat-history');
-                if (scroller) scroller.scrollTop = 0;
-            }"""
-        )
-        await asyncio.sleep(1.5)
+        # Harvest full virtualised transcript across infinite-scroller.chat-history windows
+        harvested = await _harvest_gemini_turns_from_page(page)
 
-        extracted = await page.evaluate(
-            """() => {
+        extracted = (
+            await page.evaluate(
+                """() => {
                 const messages = [];
                 // 1. Gemini App / Share turns
                 const geminiNodes = document.querySelectorAll(
@@ -1474,7 +1586,9 @@ async def fetch_chat_from_url(
                             const md = node.querySelector(
                                 'message-content, .markdown, .model-response-text'
                             ) || node;
-                            const txt = (md.innerText || '').trim();
+                            const txt = (md.innerText || '')
+                                .replace(/^Gemini said\\s*/i, '')
+                                .trim();
                             if (txt) messages.push({ role: 'assistant', content: txt });
                         }
                     });
@@ -1513,12 +1627,38 @@ async def fetch_chat_from_url(
                 }
                 return { pageTitle: pageTitle || 'Google AI Session', messages };
             }"""
+            )
+            or {}
         )
 
-        msgs = extracted.get("messages") or []
+        msgs = harvested if harvested else (extracted.get("messages") or [])
         title = _strip_directional_chars(extracted.get("pageTitle") or f"Google AI Chat {chat_id}")
         if not msgs:
-            return {"error": f"No conversation content could be extracted from {clean_url}"}
+            final_url = str(getattr(page, "url", "") or "")
+            redirected_to_home = source_tag == "browser_gemini" and final_url.rstrip("/").endswith(
+                "gemini.google.com/app"
+            )
+            if "accounts.google.com" in final_url or redirected_to_home:
+                return {
+                    "status": "login_required",
+                    "reason": "login_required",
+                    "final_url": final_url,
+                    "error": (
+                        f"Google authentication is required to access {clean_url} "
+                        f"(redirected to {final_url})."
+                    ),
+                    "suggestion": "Run 'google-ai-history setup' to sign into your Google account.",
+                }
+            return {
+                "status": "error",
+                "reason": "selector_miss_or_empty_thread",
+                "final_url": final_url,
+                "error": f"No conversation content could be extracted from {clean_url}",
+                "suggestion": (
+                    "Verify the URL points to a non-empty conversation and run "
+                    "'google-ai-history doctor' to check authentication state."
+                ),
+            }
 
         upsert_chat(
             chat_id=chat_id,

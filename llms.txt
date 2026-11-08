@@ -21,6 +21,7 @@
 - `list_google_ai_chats(limit=50, offset=0, source=None)`: Lists locally indexed Google AI conversations.
 - `sync_google_ai_chats_from_browser(target, max_chats=50, login_timeout_sec=180)`: Bulk syncs `'all'`, `'myactivity'`, `'gemini'`, `'aimode'`, `'aistudio'`, or `'notebooklm'` via Chrome CDP.
 - `import_google_ai_takeout_or_files(path)`: Imports Google Takeout archives, Google Drive `Google AI Studio` folders, or JSON/Markdown exports.
+- `google_ai_history_auth_status()`: Checks Python dependencies, Chrome/Edge path, and probes the SQLite `Cookies` DB in `chrome_profile` (`SID`, `SAPISID`, `__Secure-1PSID`, `__Secure-3PSID`) to report `google_auth_cookie_count` and `authenticated_surfaces_ready`.
 
 ## System Requirements & Operational Rules for AI Agents
 - **Zero-Browser Direct HTTP Fast-Path for Public Share Links (`~1s`)**: Public Gemini share links (`share.gemini.google/...`, `gemini.google.com/share/...`, `g.co/gemini/share/...`) are fetched directly via HTTP + `batchexecute` RPC (`ujx1Bf`) in ~1 second without needing Chrome or Google authentication (even in headless/WSL environments).
