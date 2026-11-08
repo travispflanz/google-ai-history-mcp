@@ -391,9 +391,66 @@ async def test_public_share_http_fast_path_and_doctor(
     doc_out = json.loads(capsys.readouterr().out)
     assert doc_out["public_share_links_ready"] is True
 
+    monkeypatch.setattr(sys, "argv", ["google-ai-history", "list"])
+    cli_main()
+    capsys.readouterr()
+
+    monkeypatch.setattr(sys, "argv", ["google-ai-history", "search", "test"])
+    cli_main()
+    capsys.readouterr()
+
     with patch(
         "google_ai_history.importers.sync_from_browser",
         new=AsyncMock(return_value={"status": "ok"}),
     ):
         setup_res = await setup_browser_auth(base_dir=tmp_path)
         assert setup_res["status"] == "authenticated"
+
+
+@pytest.mark.asyncio
+async def test_fetch_cookie_mismatch_and_search_ai_mode(tmp_path: Path) -> None:
+    mock_page = AsyncMock()
+    mock_page.url = "https://accounts.google.com/CookieMismatch"
+    mock_page.goto = AsyncMock()
+    mock_page.evaluate = AsyncMock(return_value={"pageTitle": "", "messages": []})
+
+    mock_context = AsyncMock()
+    mock_context.pages = [mock_page]
+
+    mock_browser = AsyncMock()
+    mock_browser.contexts = [mock_context]
+
+    with patch("playwright.async_api.async_playwright") as mock_pw:
+        pw_instance = AsyncMock()
+        mock_pw.return_value.__aenter__.return_value = pw_instance
+        pw_instance.chromium.connect_over_cdp = AsyncMock(return_value=mock_browser)
+
+        res = await fetch_chat_from_url(
+            "https://gemini.google.com/app/5d10d15809df56af",
+            base_dir=tmp_path,
+        )
+        assert res["status"] == "error"
+        assert res["reason"] == "cookie_mismatch"
+        assert "CookieMismatch" in res["error"]
+
+        # 2. Test successful Search AI Mode browser fetch
+        mock_page.url = "https://www.google.com/search?udm=50&q=test"
+        mock_page.evaluate = AsyncMock(
+            side_effect=[
+                True,  # has_turns
+                {
+                    "pageTitle": "test query",
+                    "messages": [
+                        {"role": "user", "content": "test query"},
+                        {"role": "assistant", "content": "test answer"},
+                    ],
+                },
+            ]
+        )
+        res_ai = await fetch_chat_from_url(
+            "https://www.google.com/search?udm=50&q=test",
+            base_dir=tmp_path,
+        )
+        assert res_ai["status"] == "ok"
+        assert res_ai["chat"]["title"] == "test query"
+        assert len(res_ai["chat"]["messages"]) == 2

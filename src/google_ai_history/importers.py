@@ -806,8 +806,21 @@ async def _sync_search_ai_mode_page(
                     const idx = text.indexOf(marker);
                     if (idx !== -1) {
                         text = text.slice(idx).trim();
+                        const pattern = new RegExp(
+                            'You said:\\\\s*([^\\\\n]+)\\\\n(?:[^\\\\n]*\\\\n){0,4}?' +
+                            'AI Mode reply for [^\\\\n]+\\\\n([\\\\s\\\\S]*?)' +
+                            '(?=\\\\nYou said:|\\\\nSkip to previous prompt|\\\\nAI Mode reply|$)',
+                            'g'
+                        );
+                        let match;
+                        while ((match = pattern.exec(text)) !== null) {
+                            const p = (match[1] || '').trim();
+                            let r = (match[2] || '').trim().replace(/\\nShow all\\s*$/, '').trim();
+                            if (p) messages.push({ role: 'user', content: p });
+                            if (r) messages.push({ role: 'assistant', content: r });
+                        }
                     }
-                    if (text) {
+                    if (messages.length === 0 && text) {
                         messages.push({ role: 'assistant', content: text });
                     }
                     return messages;
@@ -816,11 +829,16 @@ async def _sync_search_ai_mode_page(
             if turns:
                 real_url = page.url if tid and "udm=50" in page.url else t["url"]
                 cid = f"aimode_{tid or hashlib.sha1(t['url'].encode()).hexdigest()[:14]}"
+                final_messages = (
+                    turns
+                    if (turns and turns[0].get("role") == "user")
+                    else [{"role": "user", "content": t["title"]}, *turns]
+                )
                 synced.append(
                     upsert_chat(
                         chat_id=cid,
                         title=t["title"][:80],
-                        messages=[{"role": "user", "content": t["title"]}, *turns],
+                        messages=final_messages,
                         source="browser_search_ai_mode",
                         url=real_url,
                         base_dir=base_dir,
@@ -1496,12 +1514,19 @@ async def fetch_chat_from_url(
         await page.goto(clean_url, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(2.5)
 
-        if not is_public_share:
+        auth_required_surface = source_tag in (
+            "browser_gemini",
+            "browser_aistudio",
+            "browser_notebooklm",
+        )
+        if auth_required_surface:
             deadline = time.time() + login_timeout_sec
             logged_in = False
             clicked_sign_in = False
             while time.time() < deadline:
                 cur_url = page.url
+                if "CookieMismatch" in cur_url:
+                    break
                 if "accounts.google.com" not in cur_url:
                     has_ui = await page.evaluate(
                         """(autoClick) => {
@@ -1525,6 +1550,20 @@ async def fetch_chat_from_url(
                 await asyncio.sleep(2.0)
 
             if not logged_in:
+                if "CookieMismatch" in getattr(page, "url", ""):
+                    return {
+                        "status": "error",
+                        "reason": "cookie_mismatch",
+                        "final_url": getattr(page, "url", ""),
+                        "error": (
+                            "Google detected mismatched or corrupted cookies in the Chrome profile "
+                            "(accounts.google.com/CookieMismatch)."
+                        ),
+                        "suggestion": (
+                            "Delete ~/.gemini/google_ai_history/chrome_profile to reset cookies, "
+                            "then run 'google-ai-history setup' to start fresh."
+                        ),
+                    }
                 return {
                     "status": "login_required",
                     "reason": "login_required",
@@ -1538,7 +1577,6 @@ async def fetch_chat_from_url(
             # Re-navigate to clean_url if login flow redirected to generic /app home page
             if page.url.rstrip("/") != clean_url.rstrip("/"):
                 await page.goto(clean_url, wait_until="domcontentloaded", timeout=30000)
-
         # Wait up to 12s for SPA conversation turns to render
         for _ in range(12):
             has_turns = await page.evaluate(
@@ -1554,7 +1592,9 @@ async def fetch_chat_from_url(
             await asyncio.sleep(1.0)
 
         # Harvest full virtualised transcript across infinite-scroller.chat-history windows
-        harvested = await _harvest_gemini_turns_from_page(page)
+        harvested = (
+            await _harvest_gemini_turns_from_page(page) if source_tag == "browser_gemini" else []
+        )
 
         extracted = (
             await page.evaluate(
@@ -1609,7 +1649,31 @@ async def fetch_chat_from_url(
                     });
                 }
 
-                // 3. Fallback for Search AI Mode, NotebookLM, or generic Google AI page
+                // 3. Search AI Mode (udm=50) multi-turn extraction
+                if (messages.length === 0) {
+                    const mainEl = document.querySelector('main, [role="main"]') || document.body;
+                    let text = (mainEl?.innerText || '').trim();
+                    const marker = 'AI Mode Conversation:';
+                    const idx = text.indexOf(marker);
+                    if (idx !== -1) {
+                        text = text.slice(idx).trim();
+                        const pattern = new RegExp(
+                            'You said:\\\\s*([^\\\\n]+)\\\\n(?:[^\\\\n]*\\\\n){0,4}?' +
+                            'AI Mode reply for [^\\\\n]+\\\\n([\\\\s\\\\S]*?)' +
+                            '(?=\\\\nYou said:|\\\\nSkip to previous prompt|\\\\nAI Mode reply|$)',
+                            'g'
+                        );
+                        let match;
+                        while ((match = pattern.exec(text)) !== null) {
+                            const p = (match[1] || '').trim();
+                            let r = (match[2] || '').trim().replace(/\\nShow all\\s*$/, '').trim();
+                            if (p) messages.push({ role: 'user', content: p });
+                            if (r) messages.push({ role: 'assistant', content: r });
+                        }
+                    }
+                }
+
+                // 4. Fallback for NotebookLM or generic Google AI page
                 if (messages.length === 0) {
                     const mainEl = document.querySelector('main') || document.body;
                     const txt = (mainEl?.innerText || '').trim();
@@ -1620,9 +1684,12 @@ async def fetch_chat_from_url(
                     '[data-test-id="conversation-title"], .conversation-title, h1'
                 );
                 let pageTitle = (titleEl?.innerText || document.title || '')
-                    .replace(/^Gemini\\s*[-–—]\\s*/i, '')
+                    .replace(/^Gemini\\s*[-??]\\s*/i, '')
                     .trim();
-                if (/^(Google Gemini|Conversation with Gemini|Gemini)$/i.test(pageTitle)) {
+                const mAiTitle = pageTitle.match(/AI Mode Conversation:\\s*([^\\n]+)/i);
+                if (mAiTitle) {
+                    pageTitle = mAiTitle[1].trim();
+                } else if (/^(Google Gemini|Conversation with Gemini|Gemini)$/i.test(pageTitle)) {
                     pageTitle = messages[0]?.content?.split('\\n')[0]?.slice(0, 80) || '';
                 }
                 return { pageTitle: pageTitle || 'Google AI Session', messages };
@@ -1635,6 +1702,20 @@ async def fetch_chat_from_url(
         title = _strip_directional_chars(extracted.get("pageTitle") or f"Google AI Chat {chat_id}")
         if not msgs:
             final_url = str(getattr(page, "url", "") or "")
+            if "CookieMismatch" in final_url:
+                return {
+                    "status": "error",
+                    "reason": "cookie_mismatch",
+                    "final_url": final_url,
+                    "error": (
+                        "Google detected mismatched or corrupted cookies in the Chrome profile "
+                        "(accounts.google.com/CookieMismatch)."
+                    ),
+                    "suggestion": (
+                        "Delete ~/.gemini/google_ai_history/chrome_profile to reset cookies, "
+                        "then run 'google-ai-history setup' to start fresh."
+                    ),
+                }
             redirected_to_home = source_tag == "browser_gemini" and final_url.rstrip("/").endswith(
                 "gemini.google.com/app"
             )
