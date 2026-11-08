@@ -199,9 +199,9 @@ Google AI Studio automatically saves your prompts and chat histories as extensio
 
 ---
 
-## Development & Continuous Integration (CI)
+## Development, Pull Request Workflow & AI Issue Reporting
 
-This repository uses **Ruff** (linting & formatting), **Mypy** (static type checking), and **Pytest** (85%+ coverage gate) enforced via GitHub Actions across Ubuntu and Windows (Python 3.11, 3.12, 3.13).
+This repository follows a **Feature Branch + Pull Request + CI Gate** workflow using **Ruff** (linting & formatting), **Mypy** (static type checking), and **Pytest** (85%+ coverage gate) enforced via GitHub Actions across Ubuntu and Windows (Python 3.11, 3.12, 3.13).
 
 ```bash
 uv run ruff check .
@@ -209,3 +209,8 @@ uv run ruff format --check .
 uv run mypy src
 uv run pytest --cov=google_ai_history --cov-report=term-missing --cov-fail-under=85
 ```
+
+### Automated Issue Reporting for AI Agents
+If an AI coding agent (Antigravity, Hermes Agent, Claude Code, Cursor, etc.) discovers a bug, edge case, or Google AI DOM selector change while using `google-ai-history-mcp`:
+- **If the user has GitHub CLI (`gh auth status`) configured**: The agent should ask the user for quick confirmation and submit a sanitized issue (never including private chat transcripts) via `gh issue create --repo travispflanz/google-ai-history-mcp` (or open a PR if it patched the issue locally).
+- **If the user is not set up with GitHub CLI**: The agent should simply suggest a 1-click pre-filled link to [`github.com/travispflanz/google-ai-history-mcp/issues/new`](https://github.com/travispflanz/google-ai-history-mcp/issues/new) with a sanitized diagnostic summary. See [**`AGENTS.md`**](./AGENTS.md) for the full agent reporting protocol.
