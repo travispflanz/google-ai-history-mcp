@@ -39,12 +39,14 @@ Before running or registering `google-ai-history-mcp`, check the user's environm
 1. **Choose a persistent directory** inside the user's home or harness folder:
    - **Google Antigravity (Windows)**: `C:\Users\<user>\.gemini\antigravity\scratch\google-ai-history-mcp`
    - **macOS / Linux / Generic MCP**: `~/.gemini/antigravity/scratch/google-ai-history-mcp` or `~/.mcp/google-ai-history-mcp`
-2. **Clone and install**:
+2. **Clone, install, and run `doctor` health check**:
    ```bash
    git clone https://github.com/travispflanz/google-ai-history-mcp.git
    cd google-ai-history-mcp
    uv sync --all-groups
+   uv run google-ai-history doctor
    ```
+   - **Note on Public Share Links (`share.gemini.google/...`, `gemini.google.com/share/...`, `g.co/gemini/share/...`)**: Public Gemini share links use a direct HTTP + RPC fast-path (`_fetch_public_share_via_http`) that extracts the full native Markdown conversation in **~1 second without Chrome or Google authentication**. In headless environments (like Hermes Agent, WSL, or Linux containers), `google-ai-history fetch <share_url>` works immediately out of the box!
 
 ---
 

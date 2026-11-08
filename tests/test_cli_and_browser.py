@@ -9,9 +9,14 @@ import pytest
 from google_ai_history.cli import main as cli_main
 from google_ai_history.importers import (
     _detect_url_surface_and_id,
+    _fetch_public_share_via_http,
     _launch_chrome_visible,
+    _normalize_google_ai_url,
+    _strip_directional_chars,
+    check_system_health,
     fetch_chat_from_url,
     find_chrome_executable,
+    setup_browser_auth,
     sync_from_browser,
 )
 
@@ -226,3 +231,96 @@ async def test_sync_from_browser_all_targets_mocked(tmp_path: Path) -> None:
 
     bad = await sync_from_browser(target="invalid_target", base_dir=tmp_path)
     assert "error" in bad
+
+
+def test_normalize_url_and_strip_directional() -> None:
+    assert (
+        _normalize_google_ai_url("share.gemini.google/RknF2GkWxLcp")
+        == "https://share.gemini.google/RknF2GkWxLcp"
+    )
+    assert (
+        _normalize_google_ai_url("gemini.google.com/app/abc123")
+        == "https://gemini.google.com/app/abc123"
+    )
+    assert _strip_directional_chars("\u200eGoogle Gemini\u200f") == "Google Gemini"
+
+
+@pytest.mark.asyncio
+async def test_public_share_http_fast_path_and_doctor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    inner_payload = [
+        [
+            None,
+            [
+                [
+                    ["c_1", "r_1"],
+                    None,
+                    [["User prompt via share RPC", None, None, None, [[]]]],
+                    [[["rc_1", ["Assistant markdown response via share RPC"]]]],
+                ]
+            ],
+            [True, "\u200eShared Chat Title"],
+        ]
+    ]
+    rpc_line = json.dumps(
+        [["wrb.fr", "ujx1Bf", json.dumps(inner_payload), None, None, None, "generic"]]
+    )
+    rpc_body = f")]}}'\n\n123\n{rpc_line}\n".encode()
+
+    class DummyResp:
+        def __init__(self, body: bytes, url: str) -> None:
+            self._body = body
+            self._url = url
+            self.status = 200
+
+        def read(self) -> bytes:
+            return self._body
+
+        def geturl(self) -> str:
+            return self._url
+
+        def __enter__(self) -> "DummyResp":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+    def fake_urlopen(req: Any, timeout: float = 15) -> DummyResp:
+        url_str = req.full_url if hasattr(req, "full_url") else str(req)
+        if "batchexecute" in url_str:
+            return DummyResp(rpc_body, url_str)
+        html = b'<script>window.WIZ_global_data = {"cfb2h":"bl_test","FdrFJe":"123"};</script>'
+        return DummyResp(html, "https://gemini.google.com/share/93ab2840ce41")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    parsed = _fetch_public_share_via_http("https://share.gemini.google/RknF2GkWxLcp")
+    assert parsed is not None
+    assert parsed["title"] == "Shared Chat Title"
+    assert len(parsed["messages"]) == 2
+
+    res = await fetch_chat_from_url(
+        "share.gemini.google/RknF2GkWxLcp",
+        base_dir=tmp_path,
+    )
+    assert res["status"] == "ok"
+    assert res["method"] == "http_direct"
+    assert res["chat"]["title"] == "Shared Chat Title"
+
+    health = check_system_health(base_dir=tmp_path)
+    assert health["python_supported"] is True
+    assert health["public_share_links_ready"] is True
+
+    monkeypatch.setattr(sys, "argv", ["google-ai-history", "doctor"])
+    cli_main()
+    doc_out = json.loads(capsys.readouterr().out)
+    assert doc_out["public_share_links_ready"] is True
+
+    with patch(
+        "google_ai_history.importers.sync_from_browser",
+        new=AsyncMock(return_value={"status": "ok"}),
+    ):
+        setup_res = await setup_browser_auth(base_dir=tmp_path)
+        assert setup_res["status"] == "authenticated"

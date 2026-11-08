@@ -4,6 +4,7 @@ from fastmcp import FastMCP
 
 from google_ai_history.db import get_chat, list_chats, search_chats
 from google_ai_history.importers import (
+    _normalize_google_ai_url,
     fetch_chat_from_url,
     import_from_path,
     sync_from_browser,
@@ -40,9 +41,10 @@ async def get_google_ai_chat(
     res = get_chat(chat_id=chat_id)
     if res:
         return res
-    if chat_id.strip().startswith(("http://", "https://")):
+    normalized_url = _normalize_google_ai_url(chat_id)
+    if normalized_url.startswith(("http://", "https://")):
         fetched = await fetch_chat_from_url(
-            url=chat_id,
+            url=normalized_url,
             login_timeout_sec=login_timeout_sec,
         )
         if "chat" in fetched and fetched["chat"]:

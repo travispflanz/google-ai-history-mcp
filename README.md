@@ -68,16 +68,18 @@ To run `google-ai-history-mcp` on your computer, you need:
 2. **`uv`** ([Astral uv](https://docs.astral.sh/uv/)) and **Python 3.11+ (`3.11`, `3.12`, or `3.13`)**.
 3. **A Google Account** signed into your Google AI surfaces (`gemini.google.com`, `myactivity.google.com`, `aistudio.google.com`, etc.) — *except when importing public `gemini.google.com/share/...` links or offline Takeout files, which require no login.*
 
-### Expected Process: How First-Run Sign-In & Persistent Sync Works
-Even if you are already signed into Google in your normal everyday Chrome window, **Google Chrome v136+ blocks external debugging connections (`--remote-debugging-port`) on your default Chrome profile** while Chrome is open. To keep your main browser safe and untouched, `google-ai-history-mcp` manages a dedicated, persistent Chrome sync profile at `~/.gemini/google_ai_history/chrome_profile`:
+### Expected Process: Zero-Auth Share Links vs. First-Run Sign-In for Private Chats
 
-1. **First Run (One-Time Google Sign-In)**:
-   - The first time you ask Antigravity to import a URL or sync your history, `google-ai-history-mcp` launches a visible Chrome window on your desktop (`--remote-debugging-port=9222 --user-data-dir=~/.gemini/google_ai_history/chrome_profile`) and automatically clicks the **"Sign in"** button if you aren't logged into that profile yet.
+1. **Public Gemini Share Links (`share.gemini.google/...`, `gemini.google.com/share/...`, `g.co/gemini/share/...`) — Zero Browser & Zero Auth (`~1s`)**:
+   - Public Gemini share links are fetched directly via HTTP + Google's `batchexecute` RPC (`ujx1Bf`) in **~1 second** (`method: "http_direct"`), preserving 100% of the raw Markdown (tables, code blocks, inline backticks) **without needing Chrome or a Google login at all** (works even in headless Linux/WSL containers like Hermes Agent).
+2. **Private Chats (`gemini.google.com/app/...`, AI Mode, AI Studio, My Activity) — One-Time Google Sign-In**:
+   - Even if you are already signed into Google in your normal everyday Chrome window, **Google Chrome v136+ blocks external debugging connections (`--remote-debugging-port`) on your default Chrome profile** while Chrome is open. To keep your main browser safe and untouched, `google-ai-history-mcp` manages a dedicated, persistent Chrome sync profile at `~/.gemini/google_ai_history/chrome_profile`:
+   - The first time you ask Antigravity to import a private URL or sync your history (or run `google-ai-history setup`), `google-ai-history-mcp` launches a visible Chrome window on your desktop (`--remote-debugging-port=9222 --user-data-dir=~/.gemini/google_ai_history/chrome_profile`) and automatically clicks the **"Sign in"** button if you aren't logged into that profile yet.
    - Sign into your Google account **once** in that Chrome window.
    - As soon as sign-in finishes, `google-ai-history-mcp` automatically navigates back to your exact target URL (e.g., `https://gemini.google.com/app/<id>`), waits for the conversation turns to render, extracts the full chat, writes the Markdown file to `~/.gemini/google_ai_history/markdown/`, and indexes it in `~/.gemini/google_ai_history/chats.db`.
-2. **All Subsequent Runs (Zero Sign-In Needed)**:
+3. **All Subsequent Runs (Zero Sign-In Needed)**:
    - Because your login cookies are persisted inside `~/.gemini/google_ai_history/chrome_profile`, every future URL drop or sync reuses that authenticated session automatically without asking you to log in again.
-3. **Critical Execution Rule for AI Agents (Antigravity, Claude Code, Cursor)**:
+4. **Critical Execution Rule for AI Agents (Antigravity, Claude Code, Cursor)**:
    - **Always invoke the MCP tools (`fetch_google_ai_chat_url`, `get_google_ai_chat`, `sync_google_ai_chats_from_browser`) directly** instead of running the CLI via a sandboxed shell command (`run_command`).
    - *Why?* On Windows, agent shell sandboxes often execute inside an isolated background desktop (`WinSta0\exebox-...`), which hides any GUI browser window spawned from the shell. By contrast, the MCP server process runs on the user's interactive desktop (`WinSta0\Default`), ensuring the Chrome window is always visible when a one-time login is needed.
 
@@ -142,7 +144,16 @@ Merge the `"google-ai-history"` entry into `~/.gemini/config/mcp_config.json` (a
 ## CLI Usage (`google-ai-history`)
 
 ```bash
-# Fetch a single Google AI chat/session directly by URL
+# Check Python dependencies, Chrome/Edge availability, and authentication readiness
+uv run google-ai-history doctor
+
+# Open the dedicated Chrome profile and complete one-time Google sign-in
+uv run google-ai-history setup
+
+# Fetch a public Gemini share link in ~1s via direct HTTP (no browser or Google login needed!)
+uv run google-ai-history fetch "https://share.gemini.google/RknF2GkWxLcp"
+
+# Fetch a private Google AI chat/session directly by URL
 uv run google-ai-history fetch "https://gemini.google.com/app/1a2b3c4d5e6f"
 
 # Sync EVERYTHING from Chrome (Gemini + Search AI Mode + AI Studio + NotebookLM + My Activity Hub)

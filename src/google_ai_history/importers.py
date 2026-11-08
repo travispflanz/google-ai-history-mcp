@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +26,27 @@ SUPPORTED_TARGETS = (
     "myactivity",
     "all",
 )
+
+
+def _strip_directional_chars(text: str) -> str:
+    """Strips invisible Unicode directional marks (e.g. LRM \\u200e) that break cp1252 consoles."""
+    if not text:
+        return ""
+    return re.sub(r"[\u200b-\u200f\ufeff]", "", text).strip()
+
+
+def _normalize_google_ai_url(url: str) -> str:
+    """Prepends https:// to bare Google AI URLs like 'share.gemini.google/...'."""
+    u = url.strip()
+    if re.match(
+        r"^(?:share\.gemini\.google|gemini\.google\.com|g\.co/gemini|"
+        r"aistudio\.google\.com|notebooklm\.google\.com|myactivity\.google\.com|"
+        r"(?:www\.)?google\.com)/",
+        u,
+        flags=re.IGNORECASE,
+    ):
+        return f"https://{u}"
+    return u
 
 
 def clean_html_to_text(html_str: str) -> str:
@@ -967,7 +990,13 @@ async def sync_from_browser(
         except Exception:
             chrome_exe = find_chrome_executable()
             if not chrome_exe:
-                return {"error": "Could not find Chrome or Edge executable on this machine."}
+                return {
+                    "error": "Could not find Chrome or Edge executable on this machine.",
+                    "suggestion": (
+                        "Install Google Chrome or Microsoft Edge, then run "
+                        "'google-ai-history doctor' to verify prerequisites."
+                    ),
+                }
             _launch_chrome_visible(chrome_exe, paths["profile"], "https://gemini.google.com/app")
             for _ in range(30):
                 await asyncio.sleep(1.0)
@@ -978,7 +1007,13 @@ async def sync_from_browser(
                     continue
 
         if not browser:
-            return {"error": "Failed to connect to Chrome over CDP port 9222."}
+            return {
+                "error": "Failed to connect to Chrome over CDP port 9222.",
+                "suggestion": (
+                    "Run 'google-ai-history setup' on a desktop environment with Chrome/Edge "
+                    "to authenticate your Google account."
+                ),
+            }
 
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = context.pages[0] if context.pages else await context.new_page()
@@ -1016,9 +1051,10 @@ async def sync_from_browser(
             return {
                 "status": "login_required",
                 "message": (
-                    "Please sign into your Google account in the opened Chrome window "
-                    "and run sync_google_ai_chats_from_browser again."
+                    "Authentication required. Please sign into your Google account in the "
+                    "opened Chrome window and run 'google-ai-history setup' or retry."
                 ),
+                "suggestion": "Run 'google-ai-history setup' to complete one-time Google sign-in.",
             }
 
         synced_results: list[dict[str, Any]] = []
@@ -1043,7 +1079,7 @@ async def sync_from_browser(
 
 def _detect_url_surface_and_id(url: str) -> tuple[str, str]:
     """Classifies a Google AI URL into (source_tag, chat_id)."""
-    u = url.strip()
+    u = _normalize_google_ai_url(url)
     m_share = re.search(
         r"(?:(?:gemini\.google\.com|g\.co/gemini)/share|share\.gemini\.google)/([a-zA-Z0-9_-]+)",
         u,
@@ -1071,6 +1107,197 @@ def _detect_url_surface_and_id(url: str) -> tuple[str, str]:
     return ("url_google_ai", f"google_ai_{cid}")
 
 
+def _fetch_public_share_via_http(url: str) -> dict[str, Any] | None:
+    """Fetches a public Gemini share link in ~1s via HTTP + batchexecute RPC without Chrome/auth."""
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": ua})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+            final_url = resp.geturl()
+    except Exception:
+        return None
+
+    m_share = re.search(r"/share/([a-zA-Z0-9_-]+)", final_url) or re.search(
+        r"(?:share\.gemini\.google|/share)/([a-zA-Z0-9_-]+)", url
+    )
+    share_id = m_share.group(1) if m_share else ""
+    m_bl = re.search(r'"cfb2h":"([^"]+)"', html)
+    bl = m_bl.group(1) if m_bl else "boq_gemini-web-uiserver_20261106.06_p0"
+    m_sid = re.search(r'"FdrFJe":"([^"]+)"', html)
+    fsid = m_sid.group(1) if m_sid else ""
+
+    if share_id:
+        rpc_id = "ujx1Bf"
+        req_payload = json.dumps([[[rpc_id, json.dumps([None, share_id]), None, "generic"]]])
+        batch_url = (
+            f"https://gemini.google.com/_/BardChatUi/data/batchexecute"
+            f"?rpcids={rpc_id}&source-path=%2Fshare%2F{urllib.parse.quote(share_id)}"
+            f"&bl={urllib.parse.quote(bl)}&f.sid={urllib.parse.quote(fsid)}&hl=en&_reqid=12345&rt=c"
+        )
+        data = urllib.parse.urlencode({"f.req": req_payload}).encode("utf-8")
+        req_rpc = urllib.request.Request(
+            batch_url,
+            data=data,
+            headers={
+                "User-Agent": ua,
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req_rpc, timeout=15) as r_rpc:
+                resp_text = r_rpc.read().decode("utf-8", errors="replace")
+            for line in resp_text.splitlines():
+                if '"wrb.fr"' not in line or rpc_id not in line:
+                    continue
+                outer = json.loads(line)
+                if (
+                    isinstance(outer, list)
+                    and outer
+                    and isinstance(outer[0], list)
+                    and len(outer[0]) > 2
+                    and isinstance(outer[0][2], str)
+                ):
+                    inner = json.loads(outer[0][2])
+                    if not (isinstance(inner, list) and inner and isinstance(inner[0], list)):
+                        continue
+                    root = inner[0]
+                    turns = root[1] if len(root) > 1 and isinstance(root[1], list) else []
+                    messages: list[dict[str, Any]] = []
+                    for turn in turns:
+                        if not isinstance(turn, list) or len(turn) < 4:
+                            continue
+                        # Extract user prompt at turn[2][0][0]
+                        if (
+                            isinstance(turn[2], list)
+                            and turn[2]
+                            and isinstance(turn[2][0], list)
+                            and turn[2][0]
+                            and isinstance(turn[2][0][0], str)
+                        ):
+                            u_txt = _strip_directional_chars(turn[2][0][0])
+                            if u_txt:
+                                messages.append({"role": "user", "content": u_txt})
+                        # Extract model response markdown at turn[3][0][0][1][0]
+                        if (
+                            isinstance(turn[3], list)
+                            and turn[3]
+                            and isinstance(turn[3][0], list)
+                            and turn[3][0]
+                            and isinstance(turn[3][0][0], list)
+                            and len(turn[3][0][0]) > 1
+                            and isinstance(turn[3][0][0][1], list)
+                            and turn[3][0][0][1]
+                            and isinstance(turn[3][0][0][1][0], str)
+                        ):
+                            a_txt = _strip_directional_chars(turn[3][0][0][1][0])
+                            if a_txt:
+                                messages.append({"role": "assistant", "content": a_txt})
+                    title = ""
+                    if (
+                        len(root) > 2
+                        and isinstance(root[2], list)
+                        and len(root[2]) > 1
+                        and isinstance(root[2][1], str)
+                    ):
+                        title = _strip_directional_chars(root[2][1])
+                    if messages:
+                        if not title:
+                            title = messages[0]["content"].splitlines()[0][:80]
+                        return {"title": title, "messages": messages}
+        except Exception:
+            pass
+
+    return None
+
+
+def check_system_health(
+    base_dir: Path | str | None = None,
+    cdp_url: str = "http://127.0.0.1:9222",
+) -> dict[str, Any]:
+    """Checks system prerequisites, dependencies, Chrome/CDP status, and profile readiness."""
+    paths = ensure_dirs(base_dir)
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    py_ok = sys.version_info >= (3, 11)
+
+    deps: dict[str, bool] = {}
+    for mod_name in ("bs4", "typing_extensions", "fastmcp", "playwright"):
+        try:
+            __import__(mod_name)
+            deps[mod_name] = True
+        except Exception:
+            deps[mod_name] = False
+
+    chrome_exe = find_chrome_executable()
+    cdp_active = False
+    try:
+        with urllib.request.urlopen(f"{cdp_url.rstrip('/')}/json/version", timeout=2) as r:
+            cdp_active = r.status == 200
+    except Exception:
+        cdp_active = False
+
+    profile_dir = paths["profile"]
+    profile_initialized = (profile_dir / "Local State").exists() or (
+        profile_dir / "Default"
+    ).exists()
+
+    recommendations: list[str] = []
+    if not all(deps.values()):
+        missing = [k for k, v in deps.items() if not v]
+        recommendations.append(
+            f"Install missing Python dependencies: pip install {' '.join(missing)}"
+        )
+    if not chrome_exe:
+        recommendations.append(
+            "Chrome/Edge not found. Public Gemini share links (share.gemini.google/...) still work "
+            "via direct HTTP without a browser, but private chats require Chrome or Edge."
+        )
+    elif not profile_initialized:
+        recommendations.append(
+            "Run 'google-ai-history setup' to open Chrome and sign into Google once."
+        )
+
+    return {
+        "status": "ok" if (py_ok and all(deps.values())) else "warning",
+        "python_version": py_ver,
+        "python_supported": py_ok,
+        "dependencies": deps,
+        "chrome_executable": chrome_exe,
+        "cdp_port_9222_active": cdp_active,
+        "profile_dir": str(profile_dir),
+        "profile_initialized": profile_initialized,
+        "public_share_links_ready": True,
+        "authenticated_surfaces_ready": bool(chrome_exe and profile_initialized),
+        "recommendations": recommendations,
+    }
+
+
+async def setup_browser_auth(
+    login_timeout_sec: int = 180,
+    cdp_url: str = "http://127.0.0.1:9222",
+    base_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Opens the dedicated Chrome profile and waits for one-time Google authentication."""
+    res = await sync_from_browser(
+        max_chats=1,
+        login_timeout_sec=login_timeout_sec,
+        cdp_url=cdp_url,
+        target="gemini",
+        base_dir=base_dir,
+    )
+    if res.get("status") == "ok":
+        paths = ensure_dirs(base_dir)
+        return {
+            "status": "authenticated",
+            "message": "Google account authenticated and persistent session saved.",
+            "profile_dir": str(paths["profile"]),
+        }
+    return res
+
+
 async def fetch_chat_from_url(
     url: str,
     login_timeout_sec: int = 180,
@@ -1082,13 +1309,35 @@ async def fetch_chat_from_url(
 
     from google_ai_history.db import get_chat
 
-    clean_url = url.strip()
+    clean_url = _normalize_google_ai_url(url)
     if not clean_url.startswith(("http://", "https://")):
         return {"error": f"Invalid URL '{url}'. Must start with http:// or https://."}
 
     source_tag, chat_id = _detect_url_surface_and_id(clean_url)
     is_public_share = source_tag == "url_gemini_share"
     paths = ensure_dirs(base_dir)
+
+    # Zero-browser HTTP fast-path for public Gemini share links (~1s, no Chrome/login needed)
+    if is_public_share:
+        http_extracted = await asyncio.to_thread(_fetch_public_share_via_http, clean_url)
+        if http_extracted and http_extracted.get("messages"):
+            title = _strip_directional_chars(
+                http_extracted.get("title") or f"Google AI Chat {chat_id}"
+            )
+            upsert_chat(
+                chat_id=chat_id,
+                title=title[:100],
+                messages=http_extracted["messages"],
+                source=source_tag,
+                url=clean_url,
+                base_dir=base_dir,
+            )
+            full_record = get_chat(chat_id, base_dir=base_dir)
+            return {
+                "status": "ok",
+                "method": "http_direct",
+                "chat": full_record,
+            }
 
     async with async_playwright() as p:
         browser = None
@@ -1097,7 +1346,13 @@ async def fetch_chat_from_url(
         except Exception:
             chrome_exe = find_chrome_executable()
             if not chrome_exe:
-                return {"error": "Could not find Chrome or Edge executable on this machine."}
+                return {
+                    "error": "Could not find Chrome or Edge executable on this machine.",
+                    "suggestion": (
+                        "Install Chrome/Edge for private URLs, or use a public share link "
+                        "(https://share.gemini.google/...) which works without Chrome."
+                    ),
+                }
             _launch_chrome_visible(chrome_exe, paths["profile"], clean_url)
             for _ in range(30):
                 await asyncio.sleep(1.0)
@@ -1108,7 +1363,13 @@ async def fetch_chat_from_url(
                     continue
 
         if not browser:
-            return {"error": "Failed to connect to Chrome over CDP port 9222."}
+            return {
+                "error": "Failed to connect to Chrome over CDP port 9222.",
+                "suggestion": (
+                    "Run 'google-ai-history setup' on a desktop environment to sign in once, "
+                    "or use a public Gemini share link (https://share.gemini.google/...)."
+                ),
+            }
 
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = context.pages[0] if context.pages else await context.new_page()
@@ -1151,9 +1412,10 @@ async def fetch_chat_from_url(
                 return {
                     "status": "login_required",
                     "message": (
-                        "Please sign into your Google account in the opened Chrome window "
-                        "and run fetch_google_ai_chat_url again."
+                        "Authentication required. Please sign into your Google account in the "
+                        "opened Chrome window and run 'google-ai-history setup' or retry."
                     ),
+                    "suggestion": "Run 'google-ai-history setup' for one-time Google sign-in.",
                 }
 
             # Re-navigate to clean_url if login flow redirected to generic /app home page
@@ -1254,7 +1516,7 @@ async def fetch_chat_from_url(
         )
 
         msgs = extracted.get("messages") or []
-        title = extracted.get("pageTitle") or f"Google AI Chat {chat_id}"
+        title = _strip_directional_chars(extracted.get("pageTitle") or f"Google AI Chat {chat_id}")
         if not msgs:
             return {"error": f"No conversation content could be extracted from {clean_url}"}
 

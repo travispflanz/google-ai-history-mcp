@@ -1,19 +1,34 @@
 import argparse
 import asyncio
 import json
+import sys
 
 from google_ai_history.db import list_chats, search_chats
 from google_ai_history.importers import (
     SUPPORTED_TARGETS,
+    check_system_health,
     fetch_chat_from_url,
     import_from_path,
+    setup_browser_auth,
     sync_from_browser,
 )
 from google_ai_history.server import mcp
 
 
 def main() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
     parser = argparse.ArgumentParser(description="Google AI History MCP Server & CLI")
+    parser.add_argument(
+        "--check-auth",
+        action="store_true",
+        help="Check system prerequisites, dependencies, and Google authentication readiness",
+    )
     sub = parser.add_subparsers(dest="cmd")
 
     fetch_p = sub.add_parser(
@@ -48,10 +63,28 @@ def main() -> None:
     list_p = sub.add_parser("list", help="List synced Google AI chats")
     list_p.add_argument("--source", default=None, help="Filter by source tag")
 
+    setup_p = sub.add_parser(
+        "setup",
+        help="Open dedicated Chrome profile and complete one-time Google sign-in",
+    )
+    setup_p.add_argument("--timeout", type=int, default=180)
+
+    sub.add_parser(
+        "doctor",
+        aliases=["health"],
+        help="Check Python dependencies, Chrome/Edge availability, and authentication readiness",
+    )
+
     sub.add_parser("serve", help="Run the FastMCP stdio server")
 
     args = parser.parse_args()
-    if args.cmd == "fetch":
+    if args.check_auth or args.cmd in ("doctor", "health"):
+        res = check_system_health()
+        print(json.dumps(res, indent=2))
+    elif args.cmd == "setup":
+        res = asyncio.run(setup_browser_auth(login_timeout_sec=args.timeout))
+        print(json.dumps(res, indent=2))
+    elif args.cmd == "fetch":
         res = asyncio.run(fetch_chat_from_url(url=args.url, login_timeout_sec=args.timeout))
         print(json.dumps(res, indent=2))
     elif args.cmd == "sync":
