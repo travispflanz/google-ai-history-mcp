@@ -57,6 +57,7 @@ Google stores your AI interactions across **one central activity hub (`myactivit
 | `list_google_ai_chats` | `limit=50`, `offset=0`, `source=None` | Lists locally synced/imported Google AI chats (optionally filtered by `source`). |
 | `sync_google_ai_chats_from_browser` | `target="gemini"`, `max_chats=50`, `login_timeout_sec=180` | Attaches to Chrome over CDP (`port 9222`) and bulk-syncs threads from `'all'`, `'myactivity'`, `'gemini'`, `'aimode'`, `'aistudio'`, or `'notebooklm'`. |
 | `import_google_ai_takeout_or_files` | `path` | Imports a Google Takeout `.zip`, `MyActivity.json`, `MyActivity.html`, a `Google AI Studio` Drive folder, or exported JSON/Markdown files. |
+| `google_ai_history_auth_status` | *(none)* | Checks Python dependencies, Chrome/Edge path, and probes the SQLite `Cookies` DB in `chrome_profile` (`SID`, `SAPISID`, `__Secure-1PSID`, `__Secure-3PSID`) so AI agents know whether private URLs are ready or need one-time sign-in. |
 
 ---
 
@@ -64,7 +65,7 @@ Google stores your AI interactions across **one central activity hub (`myactivit
 
 ### Additional Requirements (Beyond Google Antigravity)
 To run `google-ai-history-mcp` on your computer, you need:
-1. **Google Chrome** or **Microsoft Edge** installed locally (used via Playwright over Chrome DevTools Protocol on `127.0.0.1:9222` for live URL fetching and browser syncing; not required for offline Takeout/Drive imports).
+1. **Google Chrome** or **Microsoft Edge** installed locally (used via Playwright's `connect_over_cdp` on `127.0.0.1:9222` for private URL fetching and browser syncing; **note: `playwright install` is NOT needed** because the tool uses your system Chrome/Edge rather than downloading bundled browsers).
 2. **`uv`** ([Astral uv](https://docs.astral.sh/uv/)) and **Python 3.11+ (`3.11`, `3.12`, or `3.13`)**.
 3. **A Google Account** signed into your Google AI surfaces (`gemini.google.com`, `myactivity.google.com`, `aistudio.google.com`, etc.) — *except when importing public `gemini.google.com/share/...` links or offline Takeout files, which require no login.*
 

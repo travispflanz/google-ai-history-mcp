@@ -5,12 +5,19 @@ from fastmcp import FastMCP
 from google_ai_history.db import get_chat, list_chats, search_chats
 from google_ai_history.importers import (
     _normalize_google_ai_url,
+    check_system_health,
     fetch_chat_from_url,
     import_from_path,
     sync_from_browser,
 )
 
 mcp = FastMCP("google-ai-history")
+
+
+@mcp.tool()
+def google_ai_history_auth_status() -> dict[str, Any]:
+    """Check Python dependencies, Chrome/Edge path, and whether Google auth cookies exist."""
+    return check_system_health()
 
 
 @mcp.tool()
