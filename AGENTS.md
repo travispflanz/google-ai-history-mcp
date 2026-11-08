@@ -153,6 +153,11 @@ When contributing improvements or fixes to this repository:
    uv run mypy src
    uv run pytest --cov=google_ai_history --cov-report=term-missing --cov-fail-under=85
    ```
-3. **Open a Pull Request & verify CI**:
-   - Push the branch and run `gh pr create --fill`.
-   - Wait for all 6 GitHub Actions CI matrix jobs (`ubuntu-latest` + `windows-latest` across Python `3.11`, `3.12`, `3.13`) to pass before squash-merging (`gh pr merge --squash --delete-branch`).
+3. **Open a Pull Request & Enable Auto-Merge (`--auto`)**:
+   - Push the branch, open the PR, and enable GitHub Auto-Merge so GitHub automatically squash-merges and deletes the branch the moment all 6 required CI status checks (`ubuntu-latest` + `windows-latest` across Python `3.11`, `3.12`, `3.13`) pass:
+     ```bash
+     git push -u origin <branch-name>
+     gh pr create --fill
+     gh pr merge --auto --squash --delete-branch
+     gh pr checks --watch --fail-fast
+     ```
