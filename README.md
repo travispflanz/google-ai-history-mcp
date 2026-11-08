@@ -83,9 +83,27 @@ Even if you are already signed into Google in your normal everyday Chrome window
 
 ---
 
-## Installation & Google Antigravity Setup
+## Installation, AI Self-Bootstrap & Google Antigravity Setup
 
-### 1. Clone & Install with `uv`
+> **For AI Agents (Antigravity, Claude Code, Cursor, Windsurf)**: See [**`AGENTS.md`**](./AGENTS.md) for the complete automated prerequisite check, installation, harness registration, and user walkthrough playbook. If a user drops this repository URL into chat and says *"Install and set this up for me"*, follow the steps below automatically.
+
+### Step 1: Check & Auto-Install Missing Prerequisites (`uv`, Python 3.11+, Chrome/Edge)
+If the user's machine is missing any prerequisite, the AI agent (or user) should install it first:
+
+- **Install `uv` (which also auto-manages Python 3.11+)**:
+  ```powershell
+  # Windows (PowerShell)
+  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+  ```
+  ```bash
+  # macOS / Linux
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
+- **Verify Google Chrome or Microsoft Edge is installed**:
+  - **Windows**: `winget install Google.Chrome` (if neither Chrome nor Edge is present)
+  - **macOS**: `brew install --cask google-chrome`
+
+### Step 2: Clone & Install `google-ai-history-mcp`
 
 ```bash
 git clone https://github.com/travispflanz/google-ai-history-mcp.git
@@ -93,20 +111,16 @@ cd google-ai-history-mcp
 uv sync --all-groups
 ```
 
-### 2. Register in Google Antigravity (`mcp_config.json`)
+### Step 3: Register in Google Antigravity (`mcp_config.json`) & Refresh
 
-Add to `~/.gemini/config/mcp_config.json` (or `~/.gemini/antigravity/mcp_config.json`):
+Merge the `"google-ai-history"` entry into `~/.gemini/config/mcp_config.json` (and `~/.gemini/antigravity/mcp_config.json` on Windows):
 
 ```json
 {
   "mcpServers": {
     "google-ai-history": {
-      "command": "uv",
+      "command": "C:\\Users\\<your-username>\\.gemini\\antigravity\\scratch\\google-ai-history-mcp\\.venv\\Scripts\\google-ai-history.exe",
       "args": [
-        "run",
-        "--directory",
-        "C:\\Users\\travi\\.gemini\\antigravity\\scratch\\google-ai-history-mcp",
-        "google-ai-history",
         "serve"
       ],
       "disabled": false
@@ -114,6 +128,14 @@ Add to `~/.gemini/config/mcp_config.json` (or `~/.gemini/antigravity/mcp_config.
   }
 }
 ```
+*(On macOS/Linux, point `"command"` to `/path/to/google-ai-history-mcp/.venv/bin/google-ai-history` or use `"command": "uv"` with `"args": ["run", "--directory", "/path/to/google-ai-history-mcp", "google-ai-history", "serve"]`.)*
+
+### Step 4: How AI Agents Should Walk the User Through First-Time Activation
+1. **Refresh the MCP Server Panel**: After editing `mcp_config.json` in an active Antigravity session, instruct the user:
+   > *"Please open the **MCP Servers** panel in Antigravity and click **Refresh / Restart** next to **`google-ai-history`**, then let me know so I can run the import."*
+2. **Explain the One-Time Chrome Sign-In Window**: Before running the very first URL fetch or browser sync, tell the user:
+   > *"A Chrome window is about to open on your desktop using a dedicated sync profile (`~/.gemini/google_ai_history/chrome_profile`). Please sign into your Google account **once** in that window—as soon as you sign in, the tool will automatically navigate to your chat, import it into Antigravity, and save your login session for all future imports."*
+3. **Offline Fallback Walkthrough**: If the user prefers not to use Chrome or wants to import **Ask Maps** / **YouTube AI** / **Google Takeout** archives, guide them to [Google Takeout](https://takeout.google.com/) (*Deselect all → My Activity [JSON format: Gemini Apps, Search, Maps, YouTube]*) or their `Google Drive/Google AI Studio` folder and call `import_google_ai_takeout_or_files(path)`.
 
 ---
 
