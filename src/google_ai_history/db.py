@@ -2,9 +2,25 @@ import json
 import os
 import re
 import sqlite3
+import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+_GENERIC_TITLES = {
+    "",
+    "playground",
+    "untitled",
+    "untitled prompt",
+    "untitled google ai chat",
+    "google ai studio",
+    "google gemini",
+    "gemini",
+    "conversation with gemini",
+    "new chat",
+    "google ai session",
+    "google ai activity",
+}
 
 
 def get_data_dir(custom_dir: Path | str | None = None) -> Path:
@@ -97,6 +113,219 @@ def _ensure_schema_columns(conn: sqlite3.Connection) -> None:
             if col_name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
 
+    _migrate_legacy_data(conn)
+
+
+def _canonicalize_aimode_url_db(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+    mtid = (qs.get("mtid") or [""])[0]
+    if not mtid and parsed.fragment:
+        m_frag = re.search(r"thread=([a-zA-Z0-9_-]+)", parsed.fragment)
+        if m_frag:
+            mtid = m_frag.group(1)
+    q_val = (qs.get("q") or [""])[0]
+    params: list[tuple[str, str]] = [("udm", "50")]
+    if mtid:
+        params.append(("mtid", mtid))
+    if q_val:
+        params.append(("q", q_val))
+    return f"https://www.google.com/search?{urllib.parse.urlencode(params)}"
+
+
+def _norm_prompt_prefix(text: str) -> str:
+    t = re.sub(
+        r"^(?:Gemini Apps|Search|AI Mode)?\s*(?:Prompted|Asked in AI Mode|Asked|Searched for)?\s*",
+        "",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(r"\.\.\.$", "", t.strip())
+    return re.sub(r"\s+", " ", t).strip().lower()
+
+
+def _delete_chat_rows(conn: sqlite3.Connection, chat_ids: list[str]) -> int:
+    if not chat_ids:
+        return 0
+    deleted = 0
+    for cid in chat_ids:
+        row = conn.execute("SELECT markdown_path FROM chats WHERE chat_id = ?", (cid,)).fetchone()
+        if row and row["markdown_path"]:
+            try:
+                p = Path(str(row["markdown_path"]))
+                if p.is_file():
+                    p.unlink()
+            except OSError:
+                pass
+        conn.execute("DELETE FROM messages WHERE chat_id = ?", (cid,))
+        conn.execute("DELETE FROM chats_fts WHERE chat_id = ?", (cid,))
+        cur = conn.execute("DELETE FROM chats WHERE chat_id = ?", (cid,))
+        deleted += cur.rowcount
+    return deleted
+
+
+def _migrate_legacy_data(conn: sqlite3.Connection) -> None:
+    """One-time safe upgrade for legacy pre-v0.5.1 rows (user_version < 2)."""
+    ver_row = conn.execute("PRAGMA user_version").fetchone()
+    ver = int(ver_row[0]) if ver_row else 0
+    if ver >= 2:
+        return
+
+    with conn:
+        # 1. Backfill first_seen_at/synced_at and clear fake sync-time created_at on legacy rows
+        conn.execute(
+            """
+            UPDATE chats
+            SET first_seen_at = COALESCE(first_seen_at, created_at),
+                synced_at = COALESCE(synced_at, updated_at),
+                created_at = CASE
+                    WHEN first_seen_at IS NULL AND source NOT LIKE 'takeout%' THEN NULL
+                    ELSE created_at
+                END
+            WHERE first_seen_at IS NULL OR synced_at IS NULL
+            """
+        )
+
+        # 2. Canonicalize existing AI Mode URLs (strip sxsrf/ved/mstk)
+        aimode_rows = conn.execute(
+            "SELECT chat_id, url FROM chats "
+            "WHERE source = 'browser_search_ai_mode' AND url IS NOT NULL"
+        ).fetchall()
+        for r in aimode_rows:
+            u = str(r["url"])
+            if "google.com/search" in u and "udm=50" in u:
+                canon = _canonicalize_aimode_url_db(u)
+                if canon != u:
+                    conn.execute(
+                        "UPDATE chats SET url = ? WHERE chat_id = ?",
+                        (canon, r["chat_id"]),
+                    )
+
+        # 3. Remove legacy My Activity stub rows superseded by full rows
+        new_rows = conn.execute(
+            """
+            SELECT c.chat_id, c.source, c.source_chat_id,
+                   (SELECT m.content FROM messages m
+                    WHERE m.chat_id = c.chat_id AND m.role = 'user' LIMIT 1) AS u
+            FROM chats c
+            WHERE c.source LIKE 'myactivity%'
+              AND (c.created_at IS NOT NULL OR c.source_chat_id IS NOT NULL)
+            """
+        ).fetchall()
+        legacy_rows = conn.execute(
+            """
+            SELECT c.chat_id, c.source, c.title,
+                   (SELECT m.content FROM messages m
+                    WHERE m.chat_id = c.chat_id AND m.role = 'user' LIMIT 1) AS u,
+                   (SELECT m.content FROM messages m
+                    WHERE m.chat_id = c.chat_id AND m.role = 'assistant' LIMIT 1) AS a
+            FROM chats c
+            WHERE c.source LIKE 'myactivity%' AND c.created_at IS NULL
+            """
+        ).fetchall()
+
+        new_by_src: dict[str, list[str]] = {}
+        for nr in new_rows:
+            norm_u = _norm_prompt_prefix(str(nr["u"] or ""))
+            if norm_u:
+                new_by_src.setdefault(str(nr["source"]), []).append(norm_u)
+
+        to_delete: list[str] = []
+        for lr in legacy_rows:
+            src = str(lr["source"])
+            lu = _norm_prompt_prefix(str(lr["u"] or lr["title"] or ""))
+            la = str(lr["a"] or "")
+            is_stub = (
+                la == "(Activity entry)"
+                or "• Details" in la
+                or "devices_other" in la
+                or str(lr["u"] or "").endswith("...")
+            )
+            if not is_stub:
+                continue
+            candidates = new_by_src.get(src, [])
+            if lu and any(
+                nu.startswith(lu[:40]) or lu.startswith(nu[:40])
+                for nu in candidates
+                if len(lu) >= 10
+            ):
+                to_delete.append(str(lr["chat_id"]))
+
+        if to_delete:
+            _delete_chat_rows(conn, to_delete)
+
+        conn.execute("PRAGMA user_version = 2")
+
+
+def delete_superseded_myactivity_stubs(
+    source: str,
+    prompt_full: str,
+    source_chat_id: str | None,
+    keep_chat_id: str,
+    base_dir: Path | str | None = None,
+) -> int:
+    """Removes older My Activity stub rows superseded by a full entry."""
+    norm_full = _norm_prompt_prefix(prompt_full)
+    if not norm_full and not source_chat_id:
+        return 0
+    conn = get_conn(base_dir)
+    try:
+        rows = conn.execute(
+            """
+            SELECT c.chat_id, c.source_chat_id, c.created_at, c.title,
+                   (SELECT m.content FROM messages m
+                    WHERE m.chat_id = c.chat_id AND m.role = 'user' LIMIT 1) AS u,
+                   (SELECT m.content FROM messages m
+                    WHERE m.chat_id = c.chat_id AND m.role = 'assistant' LIMIT 1) AS a
+            FROM chats c
+            WHERE c.source = ? AND c.chat_id != ?
+            """,
+            (source, keep_chat_id),
+        ).fetchall()
+        to_delete: list[str] = []
+        for r in rows:
+            lu = _norm_prompt_prefix(str(r["u"] or r["title"] or ""))
+            la = str(r["a"] or "")
+            is_stub = (
+                r["created_at"] is None
+                or la == "(Activity entry)"
+                or "• Details" in la
+                or "devices_other" in la
+                or str(r["u"] or "").endswith("...")
+            )
+            if not is_stub:
+                continue
+            if source_chat_id and r["source_chat_id"] == source_chat_id:
+                to_delete.append(str(r["chat_id"]))
+            elif lu and len(lu) >= 12 and (norm_full.startswith(lu[:50]) or lu == norm_full):
+                to_delete.append(str(r["chat_id"]))
+        with conn:
+            return _delete_chat_rows(conn, to_delete)
+    finally:
+        conn.close()
+
+
+def chat_exists_complete(
+    chat_id: str,
+    base_dir: Path | str | None = None,
+) -> bool:
+    """Returns True if chat_id is already stored with messages and not flagged incomplete."""
+    conn = get_conn(base_dir)
+    try:
+        row = conn.execute(
+            """
+            SELECT message_count, incomplete
+            FROM chats
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        ).fetchone()
+        if not row:
+            return False
+        return int(row["message_count"] or 0) > 0 and not row["incomplete"]
+    finally:
+        conn.close()
+
 
 def slugify(text: str, max_len: int = 60) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", text.strip()).strip("_")
@@ -138,6 +367,10 @@ def _cleanup_orphan_markdown_files(
             pass
 
 
+def _is_generic_title(title: str) -> bool:
+    return title.strip().lower() in _GENERIC_TITLES
+
+
 def upsert_chat(
     chat_id: str,
     title: str,
@@ -159,75 +392,98 @@ def upsert_chat(
     resolved_updated_at = updated_at or (msg_timestamps[-1] if msg_timestamps else now_iso)
     title = (title or "Untitled Google AI Chat").strip()
 
-    safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", chat_id)
-    md_filename = f"{slugify(title)}_{safe_id[-16:]}.md"
-    md_path = paths["markdown"] / md_filename
-
-    md_lines = [
-        f"# {title}",
-        "",
-        f"- **Chat ID**: `{chat_id}`",
-        f"- **Source**: `{source}`",
-    ]
-    if source_chat_id:
-        md_lines.append(f"- **Source Chat ID**: `{source_chat_id}`")
-    if url:
-        md_lines.append(f"- **URL**: {url}")
-    if resolved_created_at:
-        md_lines.append(f"- **Created**: `{resolved_created_at}`")
-    md_lines.extend(
-        [
-            f"- **Updated**: `{resolved_updated_at}`",
-            f"- **Synced**: `{now_iso}`",
-            f"- **Messages**: {len(messages)}",
-        ]
-    )
-    if incomplete:
-        md_lines.append(f"- **Incomplete**: `{incomplete}`")
-    md_lines.extend(["", "---", ""])
-
-    full_text_parts = [title]
-    if attachments:
-        md_lines.extend(["## Attachments", ""])
-        for att in attachments:
-            att_name = str(att.get("name") or att.get("filename") or "Attachment")
-            drive_id = att.get("drive_id")
-            att_url = att.get("url")
-            detail = f"- **{att_name}**"
-            if drive_id:
-                detail += f" (Drive ID: `{drive_id}`)"
-            if att_url:
-                detail += f" — {att_url}"
-            md_lines.append(detail)
-            full_text_parts.append(detail)
-            if att.get("content"):
-                md_lines.extend(["", str(att["content"]).strip(), ""])
-                full_text_parts.append(str(att["content"]).strip())
-        md_lines.extend(["", "---", ""])
-
-    for msg in messages:
-        role = str(msg.get("role", "user")).upper()
-        content = str(msg.get("content") or "").strip()
-        ts = msg.get("timestamp")
-        kind = msg.get("kind")
-        header = f"### {role}"
-        if kind:
-            header += f" [{kind}]"
-        if ts:
-            header += f" ({ts})"
-        md_lines.extend([header, "", content, "", "---", ""])
-        full_text_parts.append(f"{role}: {content}")
-
-    md_path.write_text("\n".join(md_lines), encoding="utf-8")
-    full_text = "\n\n".join(full_text_parts)
-    attachments_json = json.dumps(attachments, ensure_ascii=False) if attachments else None
-
     conn = get_conn(base_dir)
     try:
         prev_row = conn.execute(
-            "SELECT markdown_path, first_seen_at FROM chats WHERE chat_id = ?",
+            "SELECT title, markdown_path, first_seen_at, attachments_json "
+            "FROM chats WHERE chat_id = ?",
             (chat_id,),
         ).fetchone()
+        prev_title = str(prev_row["title"]).strip() if prev_row and prev_row["title"] else ""
+        if prev_title and not _is_generic_title(prev_title):
+            if _is_generic_title(title) or (
+                len(prev_title) > len(title) and prev_title.lower().startswith(title.lower())
+            ):
+                title = prev_title
+
+        if attachments and prev_row and prev_row["attachments_json"]:
+            try:
+                prev_atts = json.loads(str(prev_row["attachments_json"]))
+                if isinstance(prev_atts, list):
+                    for idx, att in enumerate(attachments):
+                        if (
+                            str(att.get("name") or "").lower() in ("docs", "attachment", "")
+                            and idx < len(prev_atts)
+                            and prev_atts[idx].get("name")
+                            and str(prev_atts[idx]["name"]).lower() not in ("docs", "attachment")
+                        ):
+                            att["name"] = prev_atts[idx]["name"]
+            except Exception:
+                pass
+
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", chat_id)
+        md_filename = f"{slugify(title)}_{safe_id[-16:]}.md"
+        md_path = paths["markdown"] / md_filename
+
+        md_lines = [
+            f"# {title}",
+            "",
+            f"- **Chat ID**: `{chat_id}`",
+            f"- **Source**: `{source}`",
+        ]
+        if source_chat_id:
+            md_lines.append(f"- **Source Chat ID**: `{source_chat_id}`")
+        if url:
+            md_lines.append(f"- **URL**: {url}")
+        if resolved_created_at:
+            md_lines.append(f"- **Created**: `{resolved_created_at}`")
+        md_lines.extend(
+            [
+                f"- **Updated**: `{resolved_updated_at}`",
+                f"- **Synced**: `{now_iso}`",
+                f"- **Messages**: {len(messages)}",
+            ]
+        )
+        if incomplete:
+            md_lines.append(f"- **Incomplete**: `{incomplete}`")
+        md_lines.extend(["", "---", ""])
+
+        full_text_parts = [title]
+        if attachments:
+            md_lines.extend(["## Attachments", ""])
+            for att in attachments:
+                att_name = str(att.get("name") or att.get("filename") or "Attachment")
+                drive_id = att.get("drive_id")
+                att_url = att.get("url")
+                detail = f"- **{att_name}**"
+                if drive_id:
+                    detail += f" (Drive ID: `{drive_id}`)"
+                if att_url:
+                    detail += f" — {att_url}"
+                md_lines.append(detail)
+                full_text_parts.append(detail)
+                if att.get("content"):
+                    md_lines.extend(["", str(att["content"]).strip(), ""])
+                    full_text_parts.append(str(att["content"]).strip())
+            md_lines.extend(["", "---", ""])
+
+        for msg in messages:
+            role = str(msg.get("role", "user")).upper()
+            content = str(msg.get("content") or "").strip()
+            ts = msg.get("timestamp")
+            kind = msg.get("kind")
+            header = f"### {role}"
+            if kind:
+                header += f" [{kind}]"
+            if ts:
+                header += f" ({ts})"
+            md_lines.extend([header, "", content, "", "---", ""])
+            full_text_parts.append(f"{role}: {content}")
+
+        md_path.write_text("\n".join(md_lines), encoding="utf-8")
+        full_text = "\n\n".join(full_text_parts)
+        attachments_json = json.dumps(attachments, ensure_ascii=False) if attachments else None
+
         prev_md_path = (
             str(prev_row["markdown_path"]) if prev_row and prev_row["markdown_path"] else None
         )

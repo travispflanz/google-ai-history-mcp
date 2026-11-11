@@ -7,7 +7,9 @@ from google_ai_history.importers import (
     _normalize_google_ai_url,
     check_system_health,
     fetch_chat_from_url,
+    get_sync_job_status,
     import_from_path,
+    start_sync_job,
     sync_from_browser,
 )
 
@@ -82,10 +84,31 @@ async def sync_google_ai_chats_from_browser(
     target: str = "gemini",
     max_chats: int = 50,
     login_timeout_sec: int = 180,
+    skip_existing: bool = False,
+    offset: int = 0,
+    time_budget_sec: int = 140,
+    background: bool = False,
 ) -> dict[str, Any]:
     """Sync Google AI chats via Chrome ('all', 'myactivity', 'gemini', 'aimode', 'aistudio')."""
+    if background:
+        return start_sync_job(
+            max_chats=max_chats,
+            login_timeout_sec=login_timeout_sec,
+            target=target,
+            skip_existing=skip_existing,
+            offset=offset,
+        )
     return await sync_from_browser(
         max_chats=max_chats,
         login_timeout_sec=login_timeout_sec,
         target=target,
+        skip_existing=skip_existing,
+        offset=offset,
+        time_budget_sec=time_budget_sec,
     )
+
+
+@mcp.tool()
+def get_sync_status(job_id: str | None = None) -> dict[str, Any]:
+    """Check progress/results of a background sync job started with background=True."""
+    return get_sync_job_status(job_id=job_id)

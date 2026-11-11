@@ -11,14 +11,21 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
-from google_ai_history.db import ensure_dirs, upsert_chat
+from google_ai_history.db import (
+    chat_exists_complete,
+    delete_superseded_myactivity_stubs,
+    ensure_dirs,
+    upsert_chat,
+)
 
 SUPPORTED_TARGETS = (
     "gemini",
@@ -29,10 +36,19 @@ SUPPORTED_TARGETS = (
     "all",
 )
 
+_ACTIVE_PROGRESS_CB: Callable[[str], None] | None = None
+_SYNC_JOBS: dict[str, dict[str, Any]] = {}
+
 
 def _log_progress(message: str) -> None:
     """Writes live progress updates to stderr so stdout remains clean JSON for MCP."""
-    print(f"[google-ai-history] {message}", file=sys.stderr, flush=True)
+    line = f"[google-ai-history] {message}"
+    print(line, file=sys.stderr, flush=True)
+    if _ACTIVE_PROGRESS_CB is not None:
+        try:
+            _ACTIVE_PROGRESS_CB(line)
+        except Exception:
+            pass
 
 
 def _strip_directional_chars(text: str) -> str:
@@ -51,6 +67,147 @@ def _clean_gemini_title(raw_title: str) -> str:
     if re.fullmatch(r"(?:Google\s+Gemini|Conversation\s+with\s+Gemini|Gemini)", title, re.I):
         return ""
     return title
+
+
+def _clean_aistudio_title(raw_title: str) -> str:
+    """Normalizes an AI Studio title and filters generic UI headers like 'Playground'."""
+    title = _strip_directional_chars(raw_title)
+    title = re.sub(r"\s*\|\s*Google AI Studio$", "", title, flags=re.IGNORECASE).strip()
+    if re.fullmatch(
+        r"(?:Playground|Untitled(?:\s+prompt)?|Google AI Studio|New chat)",
+        title,
+        re.I,
+    ):
+        return ""
+    return title
+
+
+def _html_to_markdown(html_str: str) -> str:
+    """Converts Deep Research / Gemini HTML into structured Markdown preserving blocks & tables."""
+    if not html_str:
+        return ""
+    soup = BeautifulSoup(html_str, "html.parser")
+    for junk in soup.select(
+        "button, mat-icon, .material-symbols-outlined, .material-symbols-rounded, "
+        ".material-icons, [aria-hidden='true'], annotation, script, style, .katex-error"
+    ):
+        junk.decompose()
+
+    def _inline(node: Any) -> str:
+        if isinstance(node, str):
+            return node
+        if not isinstance(node, Tag):
+            return ""
+        tag = node.name.lower()
+        if tag == "br":
+            return "\n"
+        if tag in ("strong", "b"):
+            inner = "".join(_inline(c) for c in node.children).strip()
+            return f"**{inner}**" if inner else ""
+        if tag in ("em", "i"):
+            inner = "".join(_inline(c) for c in node.children).strip()
+            return f"*{inner}*" if inner else ""
+        if tag == "code" and (not node.parent or node.parent.name.lower() != "pre"):
+            inner = node.get_text()
+            return f"`{inner}`" if inner else ""
+        if tag == "a":
+            href = str(node.get("href") or "").strip()
+            txt = "".join(_inline(c) for c in node.children).strip()
+            if href and txt:
+                return f"[{txt}]({href})"
+            return txt or href
+        return "".join(_inline(c) for c in node.children)
+
+    blocks: list[str] = []
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, str):
+            s = node.strip()
+            if s:
+                blocks.append(s)
+            return
+        if not isinstance(node, Tag):
+            return
+        tag = node.name.lower()
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            lvl = int(tag[1])
+            txt = re.sub(r"\s+", " ", "".join(_inline(c) for c in node.children)).strip()
+            if txt:
+                blocks.append(f"{'#' * lvl} {txt}")
+        elif tag == "p":
+            txt = re.sub(r"[ \t]+", " ", "".join(_inline(c) for c in node.children)).strip()
+            if txt:
+                blocks.append(txt)
+        elif tag == "pre":
+            code = node.get_text().strip("\n")
+            if code:
+                blocks.append(f"```\n{code}\n```")
+        elif tag in ("ul", "ol"):
+            lines: list[str] = []
+            li_idx = 0
+            for child in node.children:
+                if isinstance(child, Tag) and child.name.lower() == "li":
+                    li_idx += 1
+                    prefix = f"{li_idx}. " if tag == "ol" else "- "
+                    txt = re.sub(r"\s+", " ", "".join(_inline(c) for c in child.children)).strip()
+                    if txt:
+                        lines.append(f"{prefix}{txt}")
+            if lines:
+                blocks.append("\n".join(lines))
+        elif tag == "table":
+            rows_md: list[list[str]] = []
+            for tr in node.select("tr"):
+                cells = [
+                    re.sub(r"\s+", " ", "".join(_inline(c) for c in td.children)).strip()
+                    for td in tr.find_all(["th", "td"])
+                ]
+                if any(cells):
+                    rows_md.append(cells)
+            if rows_md:
+                ncols = max(len(r) for r in rows_md)
+                padded = [r + [""] * (ncols - len(r)) for r in rows_md]
+                tbl = [
+                    "| " + " | ".join(padded[0]) + " |",
+                    "| " + " | ".join(["---"] * ncols) + " |",
+                ]
+                for r in padded[1:]:
+                    tbl.append("| " + " | ".join(r) + " |")
+                blocks.append("\n".join(tbl))
+        elif tag == "hr":
+            blocks.append("---")
+        elif tag == "blockquote":
+            txt = re.sub(r"\s+", " ", "".join(_inline(c) for c in node.children)).strip()
+            if txt:
+                blocks.append(f"> {txt}")
+        else:
+            block_tags = (
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+                "p",
+                "ul",
+                "ol",
+                "pre",
+                "table",
+                "blockquote",
+                "hr",
+                "div",
+                "section",
+                "article",
+            )
+            if node.find(block_tags) is not None:
+                for c in node.children:
+                    _walk(c)
+            else:
+                txt = re.sub(r"[ \t]+", " ", "".join(_inline(c) for c in node.children)).strip()
+                if txt:
+                    blocks.append(txt)
+
+    _walk(soup)
+    return _strip_directional_chars("\n\n".join(blocks))
 
 
 def _canonicalize_aimode_url(
@@ -671,7 +828,7 @@ def _extract_gemini_card_timestamp(messages: list[dict[str, Any]]) -> str | None
 
 
 async def _extract_gemini_deep_research_report(page: Any) -> dict[str, Any]:
-    """Opens and scrapes Gemini's Deep Research immersive panel if present."""
+    """Opens and scrapes Gemini's Deep Research immersive panel (with Markdown & sources)."""
     panel_js = """() => {
         const panel = document.querySelector(
             'deep-research-immersive-panel, immersive-panel'
@@ -680,20 +837,49 @@ async def _extract_gemini_deep_research_report(page: Any) -> dict[str, Any]:
         const container = panel.querySelector(
             'message-content, .markdown, structured-content-container, response-element'
         ) || panel;
-        const clone = container.cloneNode(true);
-        clone.querySelectorAll(
-            'button, mat-icon, .material-symbols-outlined, .material-icons, [aria-hidden="true"]'
-        ).forEach(el => el.remove());
-        const text = (clone.innerText || clone.textContent || '').trim();
-        return { text, length: text.length };
+        const html = container.innerHTML || '';
+        const text = (container.innerText || container.textContent || '').trim();
+        const sources = [];
+        const seenHref = new Set();
+        panel.querySelectorAll('a[href]').forEach(a => {
+            const href = (a.href || '').trim();
+            if (!href || !href.startsWith('http')) return;
+            if (/accounts\\.google|support\\.google|policies\\.google/i.test(href)) return;
+            if (/myactivity\\.google|gemini\\.google/i.test(href)) return;
+            if (seenHref.has(href)) return;
+            seenHref.add(href);
+            const rawTxt = (a.innerText || a.getAttribute('aria-label') || href)
+                .replace(/\\s*Opens in a new window\\s*/gi, '')
+                .replace(/\\s+/g, ' ')
+                .trim();
+            sources.push({ href, title: rawTxt || href });
+        });
+        return { html, text, length: text.length, sources };
     }"""
+
+    def _format_report(panel_res: dict[str, Any]) -> str:
+        html_str = str(panel_res.get("html") or "")
+        md = _html_to_markdown(html_str) if html_str else ""
+        if not md:
+            md = _strip_directional_chars(str(panel_res.get("text") or ""))
+        sources = panel_res.get("sources") or []
+        if sources and "## Sources" not in md:
+            src_lines = ["", "## Sources", ""]
+            for idx, src in enumerate(sources, start=1):
+                if isinstance(src, dict) and src.get("href"):
+                    title = str(src.get("title") or src["href"]).strip()
+                    src_lines.append(f"{idx}. [{title}]({src['href']})")
+            md = md + "\n" + "\n".join(src_lines)
+        return md.strip()
 
     try:
         panel_res = await page.evaluate(panel_js)
-        if isinstance(panel_res, dict) and (panel_res.get("text") or "").strip():
+        if isinstance(panel_res, dict) and (
+            (panel_res.get("text") or "").strip() or (panel_res.get("html") or "").strip()
+        ):
             return {
                 "found_card": True,
-                "report": _strip_directional_chars(panel_res["text"]),
+                "report": _format_report(panel_res),
             }
 
         clicked = await page.evaluate(
@@ -734,10 +920,12 @@ async def _extract_gemini_deep_research_report(page: Any) -> dict[str, Any]:
             for _ in range(8):
                 await asyncio.sleep(0.5)
                 panel_res = await page.evaluate(panel_js)
-                if isinstance(panel_res, dict) and (panel_res.get("text") or "").strip():
+                if isinstance(panel_res, dict) and (
+                    (panel_res.get("text") or "").strip() or (panel_res.get("html") or "").strip()
+                ):
                     return {
                         "found_card": True,
-                        "report": _strip_directional_chars(panel_res["text"]),
+                        "report": _format_report(panel_res),
                     }
             return {"found_card": True, "report": None}
     except Exception:
@@ -755,9 +943,21 @@ async def _extract_gemini_chat_from_page(
     if not isinstance(extracted, dict):
         extracted = {}
 
-    msgs: list[dict[str, Any]] = (
-        list(harvested) if harvested else list(extracted.get("messages") or [])
-    )
+    snap_msgs = list(extracted.get("messages") or [])
+    # Prefer single-snapshot DOM order when all turns are mounted and complete
+    if snap_msgs and (
+        not harvested
+        or (
+            len(snap_msgs) >= len(harvested)
+            and all(
+                len(str(sm.get("content") or "")) >= len(str(hm.get("content") or ""))
+                for sm, hm in zip(snap_msgs, harvested, strict=False)
+            )
+        )
+    ):
+        msgs: list[dict[str, Any]] = snap_msgs
+    else:
+        msgs = list(harvested) if harvested else snap_msgs
 
     dr_ts = _extract_gemini_card_timestamp(msgs)
     if dr_ts and msgs:
@@ -808,13 +1008,18 @@ async def _sync_gemini_app_page(
     max_chats: int,
     base_dir: Path | str | None,
     extra_chats: list[dict[str, str]] | None = None,
+    skip_existing: bool = False,
+    offset: int = 0,
+    deadline_ts: float | None = None,
+    skipped_out: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    _log_progress(f"Starting Gemini sync (max_chats={max_chats})...")
+    _log_progress(f"Starting Gemini sync (max_chats={max_chats}, offset={offset})...")
     collected_chats: list[dict[str, str]] = []
     seen_ids: set[str] = set()
+    skipped: list[dict[str, Any]] = skipped_out if skipped_out is not None else []
 
     if extra_chats is None:
-        await page.goto("https://gemini.google.com/search", wait_until="domcontentloaded")
+        await page.goto("https://gemini.google.com/library", wait_until="domcontentloaded")
         await asyncio.sleep(4.0)
 
         await page.evaluate(
@@ -822,8 +1027,7 @@ async def _sync_gemini_app_page(
                 const sidenav = document.querySelector('bard-sidenav');
                 const isCollapsed = !!(sidenav && sidenav.className.includes('collapsed'));
                 const isOpen = !isCollapsed && !!document.querySelector(
-                    'bard-sidenav.sidenav-open, button[aria-label*="Close sidebar" i], ' +
-                    'conversations-list a[href*="/app/"]'
+                    'bard-sidenav.sidenav-open, button[aria-label*="Close sidebar" i]'
                 );
                 if (!isOpen || isCollapsed) {
                     const menuBtn = document.querySelector(
@@ -837,22 +1041,58 @@ async def _sync_gemini_app_page(
                 }
             }"""
         )
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.2)
+        await page.evaluate(
+            """() => {
+                const scope = document.querySelector('bard-sidenav') || document;
+                const linksNow = scope.querySelectorAll('a[href*="/app/"]');
+                const toggleBtn = scope.querySelector(
+                    'button[aria-label="Toggle All"], ' +
+                    '[data-test-id="expandable-section-toggle"]'
+                );
+                if (toggleBtn) {
+                    const exp = toggleBtn.getAttribute('aria-expanded');
+                    const sc = scope.querySelector('infinite-scroller');
+                    const collapsedSc = sc && sc.scrollHeight <= sc.clientHeight + 5;
+                    if (exp === 'false' || collapsedSc) toggleBtn.click();
+                }
+                if (linksNow.length === 0) {
+                    const sb = document.querySelector('button[aria-label="Search chats"]');
+                    if (sb) sb.click();
+                }
+            }"""
+        )
+        await asyncio.sleep(1.5)
 
         stale_scroll_rounds = 0
-        for attempt in range(50):
+        for attempt in range(60):
             items = await page.evaluate(
                 """() => {
                     const out = [];
-                    document.querySelectorAll('a[href*="/app/"]').forEach(a => {
+                    const root = document.querySelector('bard-sidenav a[href*="/app/"]')
+                        ? document.querySelector('bard-sidenav')
+                        : document;
+                    root.querySelectorAll('a[href*="/app/"]').forEach(a => {
                         const href = a.getAttribute('href') || '';
                         if (/accounts\\.google\\.com|SignOutOptions/i.test(href)) return;
                         const m = href.match(/\\/app\\/([a-zA-Z0-9_-]{8,})/);
                         if (m) {
+                            const cl = a.cloneNode(true);
+                            cl.querySelectorAll(
+                                'mat-icon, .material-symbols-outlined, ' +
+                                '.material-symbols-rounded, .material-icons'
+                            ).forEach(el => el.remove());
+                            const rawTxt = (
+                                cl.innerText || a.innerText || a.getAttribute('aria-label') || ''
+                            );
+                            const lines = rawTxt
+                                .split('\\n')
+                                .map(l => l.trim())
+                                .filter(l => l && !/^(chat_bubble|\\d+[hdwmy])$/i.test(l));
                             out.push({
                                 id: m[1],
                                 url: new URL(href, location.origin).href,
-                                title: (a.innerText || a.getAttribute('aria-label') || '').trim()
+                                title: lines[0] || 'Gemini Chat'
                             });
                         }
                     });
@@ -885,18 +1125,11 @@ async def _sync_gemini_app_page(
                     collected_chats.append(item)
                     new_found += 1
 
-            if len(collected_chats) >= max_chats:
+            if len(collected_chats) >= offset + max_chats:
                 break
 
             scrolled = await page.evaluate(
                 """() => {
-                    const moreBtn = Array.from(
-                        document.querySelectorAll('conversations-list button, bard-sidenav button')
-                    ).find(el => /show more|load more/i.test((el.innerText || '').trim()));
-                    if (moreBtn) {
-                        moreBtn.click();
-                        return true;
-                    }
                     const scrollers = document.querySelectorAll(
                         'bard-sidenav infinite-scroller, ' +
                         'side-navigation-content infinite-scroller, ' +
@@ -913,9 +1146,29 @@ async def _sync_gemini_app_page(
                             didScroll = true;
                         }
                     });
+                    const links = document.querySelectorAll('conversations-list a[href*="/app/"]');
+                    if (links.length > 0) {
+                        const last = links[links.length - 1];
+                        if (typeof last.scrollIntoView === 'function') {
+                            last.scrollIntoView({ block: 'end' });
+                        }
+                    }
                     return didScroll;
                 }"""
             )
+            try:
+                last_loc = page.locator('conversations-list a[href*="/app/"]').last
+                if await last_loc.count() > 0:
+                    box = await last_loc.bounding_box()
+                    if box:
+                        await page.mouse.move(
+                            box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+                        )
+                        await page.mouse.wheel(0, 1500)
+                        scrolled = True
+            except Exception:
+                pass
+
             await asyncio.sleep(1.5)
             if not scrolled and new_found == 0:
                 stale_scroll_rounds += 1
@@ -930,17 +1183,35 @@ async def _sync_gemini_app_page(
                 seen_ids.add(cid)
                 collected_chats.append(item)
 
-    _log_progress(f"[gemini] Found {len(collected_chats)} chat(s); syncing up to {max_chats}...")
+    _log_progress(
+        f"[gemini] Found {len(collected_chats)} chat(s); "
+        f"syncing up to {max_chats} (offset={offset})..."
+    )
     synced_results: list[dict[str, Any]] = []
-    targets = collected_chats[:max_chats]
+    targets = collected_chats[offset : offset + max_chats]
     for idx, chat_meta in enumerate(targets, start=1):
+        if deadline_ts and time.time() >= deadline_ts:
+            _log_progress(f"[gemini] Time budget reached after {idx - 1}/{len(targets)} chat(s).")
+            break
         cid = chat_meta["id"]
         url = chat_meta["url"]
+        if skip_existing and chat_exists_complete(cid, base_dir=base_dir):
+            skipped.append({"chat_id": cid, "reason": "already_synced"})
+            continue
         title_hint = chat_meta.get("title") or f"Gemini Chat {cid}"
         _log_progress(f"[gemini] ({idx}/{len(targets)}) {cid}")
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            await asyncio.sleep(4.0)
+            for _ in range(24):
+                has_turns = await page.evaluate(
+                    """() => document.querySelectorAll(
+                        'user-query, model-response, [data-message-author-role]'
+                    ).length > 0"""
+                )
+                if has_turns:
+                    break
+                await asyncio.sleep(0.5)
+            await asyncio.sleep(1.0)
             parsed = await _extract_gemini_chat_from_page(page, title_hint=title_hint)
             if parsed["messages"]:
                 saved = upsert_chat(
@@ -954,10 +1225,13 @@ async def _sync_gemini_app_page(
                     incomplete=parsed.get("incomplete"),
                 )
                 synced_results.append(saved)
+            else:
+                skipped.append({"chat_id": cid, "reason": "empty_messages_or_unrendered"})
         except Exception as exc:
             synced_results.append({"chat_id": cid, "error": str(exc)})
     _log_progress(
-        f"[gemini] Completed: {len([r for r in synced_results if 'markdown_path' in r])} synced."
+        f"[gemini] Completed: {len([r for r in synced_results if 'markdown_path' in r])} synced, "
+        f"{len(skipped)} skipped."
     )
     return synced_results
 
@@ -1001,7 +1275,6 @@ async def _harvest_gemini_turns_from_page(page: Any) -> list[dict[str, Any]]:
         return res if isinstance(res, dict) else {}
 
     harvested: list[dict[str, Any]] = []
-    seen_keys: set[tuple[str, str]] = set()
 
     def _absorb(window: list[dict[str, Any]] | None) -> None:
         for w in window or []:
@@ -1011,9 +1284,21 @@ async def _harvest_gemini_turns_from_page(page: Any) -> list[dict[str, Any]]:
             content = _strip_directional_chars(str(w.get("content") or ""))
             if not role or not content:
                 continue
-            k = (role, content)
-            if k not in seen_keys:
-                seen_keys.add(k)
+            merged = False
+            for existing in harvested:
+                if existing["role"] != role:
+                    continue
+                prev = existing["content"]
+                if prev == content:
+                    merged = True
+                    break
+                prefix_len = min(len(prev), len(content), 50)
+                if prefix_len >= 20 and prev[:prefix_len] == content[:prefix_len]:
+                    if content.startswith(prev[:prefix_len]) and len(content) > len(prev):
+                        existing["content"] = content
+                    merged = True
+                    break
+            if not merged:
                 harvested.append({"role": role, "content": content})
 
     try:
@@ -1047,9 +1332,14 @@ async def _sync_search_ai_mode_page(
     page: Any,
     max_chats: int,
     base_dir: Path | str | None,
+    skip_existing: bool = False,
+    offset: int = 0,
+    deadline_ts: float | None = None,
+    skipped_out: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Scrapes Google Search AI Mode (google.com/search?udm=50 / AI Mode history sidebar)."""
     _log_progress(f"Starting Search AI Mode sync (max_chats={max_chats})...")
+    skipped: list[dict[str, Any]] = skipped_out if skipped_out is not None else []
     await page.goto("https://www.google.com/search?udm=50", wait_until="domcontentloaded")
     await asyncio.sleep(3.0)
 
@@ -1113,11 +1403,19 @@ async def _sync_search_ai_mode_page(
 
     _log_progress(f"[aimode] Found {len(unique_threads)} thread(s); syncing up to {max_chats}...")
     synced: list[dict[str, Any]] = []
-    targets = unique_threads[:max_chats]
+    targets = unique_threads[offset : offset + max_chats]
     for idx, t in enumerate(targets, start=1):
+        if deadline_ts and time.time() >= deadline_ts:
+            _log_progress(f"[aimode] Time budget reached after {idx - 1}/{len(targets)} thread(s).")
+            break
+        tid = t.get("threadId")
+        pre_canon = _canonicalize_aimode_url(t["url"], thread_id=tid, query=t.get("title"))
+        pre_cid = f"aimode_{tid or hashlib.sha1(pre_canon.encode()).hexdigest()[:14]}"
+        if skip_existing and chat_exists_complete(pre_cid, base_dir=base_dir):
+            skipped.append({"chat_id": pre_cid, "reason": "already_synced"})
+            continue
         _log_progress(f"[aimode] ({idx}/{len(targets)}) {t.get('title', '')[:40]}")
         try:
-            tid = t.get("threadId")
             if tid:
                 await page.evaluate(
                     """(threadId) => {
@@ -1192,6 +1490,8 @@ async def _sync_search_ai_mode_page(
                         base_dir=base_dir,
                     )
                 )
+            else:
+                skipped.append({"chat_id": pre_cid, "reason": "empty_messages_or_unrendered"})
         except Exception as exc:
             synced.append({"url": t["url"], "error": str(exc)})
     _log_progress(f"[aimode] Completed: {len([r for r in synced if 'markdown_path' in r])} synced.")
@@ -1213,13 +1513,26 @@ _AISTUDIO_HARVEST_JS = """() => {
     };
 
     const parseFileChunk = (fc) => {
-        const nameEl = fc.querySelector('.name, [title]');
-        const name = (nameEl?.getAttribute('title') || nameEl?.innerText || fc.innerText || '')
-            .trim()
-            .split('\\n')[0]
-            .trim();
+        const cleanFc = fc.cloneNode(true);
+        cleanFc.querySelectorAll(
+            '.file-icon, mat-icon, .material-symbols-outlined, .material-symbols-rounded, ' +
+            '.material-symbols-filled, .material-icons, [aria-hidden="true"]'
+        ).forEach(el => el.remove());
+        const nameEl = cleanFc.querySelector('.name');
+        let name = (
+            nameEl?.getAttribute('title') ||
+            nameEl?.innerText ||
+            nameEl?.textContent ||
+            ''
+        ).trim().split('\\n')[0].trim();
+        if (!name) {
+            const titled = cleanFc.querySelector('[title]');
+            name = (titled?.getAttribute('title') || '').trim();
+        }
+        const iconNames = /^(docs|progress_activity|description|attach_file|insert_drive_file)$/i;
+        if (iconNames.test(name)) name = '';
         const tokensEl = fc.querySelector('.token-count');
-        const tokens = (tokensEl?.innerText || '').trim();
+        const tokens = (tokensEl?.innerText || tokensEl?.textContent || '').trim();
         let driveId = fc.getAttribute('data-drive-id') ||
             fc.querySelector('[data-drive-id]')?.getAttribute('data-drive-id') || '';
         let url = '';
@@ -1238,9 +1551,9 @@ _AISTUDIO_HARVEST_JS = """() => {
         if (driveId && (!url || url.includes('drive-storage'))) {
             url = `https://drive.google.com/file/d/${driveId}/view`;
         }
-        if (name || driveId) {
+        if (name || driveId || tokens) {
             return {
-                name: name || driveId || 'Drive Attachment',
+                name: name || driveId || 'Attachment',
                 tokens: tokens || null,
                 drive_id: driveId || null,
                 url: url || null,
@@ -1315,16 +1628,21 @@ _AISTUDIO_HARVEST_JS = """() => {
         });
     }
 
+    const docTitle = (document.title || '').replace(/\\s*\\|\\s*Google AI Studio$/i, '').trim();
     const titleEl = document.querySelector('h1.mode-title, .page-title h1, h1');
-    let pageTitle = '';
+    let elTitle = '';
     if (titleEl) {
         const cleanTitle = stripIcons(titleEl);
-        pageTitle = (cleanTitle.innerText || cleanTitle.textContent || '').trim();
+        elTitle = (cleanTitle.innerText || cleanTitle.textContent || '').trim();
     }
-    if (!pageTitle) {
-        pageTitle = (document.title || '').replace(/\\s*\\|\\s*Google AI Studio$/i, '').trim();
+    const genericRe = /^(Playground|Untitled(?:\\s+prompt)?|Google AI Studio|New chat)$/i;
+    let pageTitle = '';
+    if (docTitle && !genericRe.test(docTitle)) {
+        pageTitle = docTitle;
+    } else if (elTitle && !genericRe.test(elTitle)) {
+        pageTitle = elTitle;
     }
-    return { pageTitle, turns: out, attachments };
+    return { pageTitle, docTitle, elTitle, turns: out, attachments };
 }"""
 
 
@@ -1357,12 +1675,21 @@ async def _extract_aistudio_from_page(
             return
         if not isinstance(res, dict):
             return
-        if res.get("pageTitle") and not extracted_title:
-            extracted_title = _strip_directional_chars(str(res["pageTitle"]))
+        cand_title = _clean_aistudio_title(str(res.get("pageTitle") or ""))
+        if cand_title and not extracted_title:
+            extracted_title = cand_title
         for att in res.get("attachments") or []:
             if isinstance(att, dict):
-                key = (str(att.get("name") or ""), str(att.get("drive_id") or ""))
-                attachments_map[key] = att
+                key = (
+                    str(att.get("drive_id") or ""),
+                    str(att.get("tokens") or att.get("name") or ""),
+                )
+                prev_att = attachments_map.get(key)
+                if prev_att is None or (
+                    str(prev_att.get("name") or "").lower() in ("", "docs", "attachment")
+                    and str(att.get("name") or "").lower() not in ("", "docs", "attachment")
+                ):
+                    attachments_map[key] = att
         for t in res.get("turns") or []:
             if not isinstance(t, dict):
                 continue
@@ -1370,19 +1697,44 @@ async def _extract_aistudio_from_page(
             prev = collected_by_id.get(tid)
             if tid not in collected_by_id:
                 ordered_ids.append(tid)
-            # Keep whichever version actually rendered non-empty content/attachments
-            has_new_data = bool(
-                (t.get("text") or "").strip()
-                or (t.get("thought") or "").strip()
-                or (t.get("attachments") or [])
-            )
-            if prev is None or has_new_data:
-                if prev is not None and not has_new_data:
-                    continue
-                collected_by_id[tid] = t
+                collected_by_id[tid] = dict(t)
+            else:
+                assert prev is not None
+                new_text = str(t.get("text") or "")
+                old_text = str(prev.get("text") or "")
+                if len(new_text.strip()) > len(old_text.strip()):
+                    prev["text"] = new_text
+                new_thought = str(t.get("thought") or "")
+                old_thought = str(prev.get("thought") or "")
+                if len(new_thought.strip()) > len(old_thought.strip()):
+                    prev["thought"] = new_thought
+                new_atts = t.get("attachments") or []
+                old_atts = prev.get("attachments") or []
+                generic_names = {"", "docs", "attachment"}
+                if new_atts and (
+                    not old_atts
+                    or (
+                        all(
+                            str(a.get("name") or "").strip().lower() in generic_names
+                            for a in old_atts
+                            if isinstance(a, dict)
+                        )
+                        and any(
+                            str(a.get("name") or "").strip().lower() not in generic_names
+                            for a in new_atts
+                            if isinstance(a, dict)
+                        )
+                    )
+                ):
+                    prev["attachments"] = new_atts
+                if not prev.get("role") and t.get("role"):
+                    prev["role"] = t["role"]
 
     try:
-        # Scroll to top so early turns (such as Turn 0 Drive attachments) mount
+        # 1. Harvest initial viewport BEFORE jumping so already-rendered bottom turns are captured
+        _absorb(await page.evaluate(_AISTUDIO_HARVEST_JS))
+
+        # 2. Jump to top so early turns (such as Turn 0 Drive attachments) mount
         await page.evaluate(
             """() => {
                 document.querySelectorAll(
@@ -1392,10 +1744,50 @@ async def _extract_aistudio_from_page(
                 if (sc) sc.scrollTop = 0;
             }"""
         )
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.5)
+        # Wait briefly if ms-file-chunk exists without .name rendered yet
+        for _ in range(5):
+            fc_ready = await page.evaluate(
+                """() => {
+                    const fc = document.querySelector('ms-file-chunk');
+                    if (!fc) return true;
+                    const nm = fc.querySelector('.name');
+                    return !!(nm && (nm.getAttribute('title') || nm.innerText || '').trim());
+                }"""
+            )
+            if fc_ready is not False:
+                break
+            await asyncio.sleep(0.4)
         _absorb(await page.evaluate(_AISTUDIO_HARVEST_JS))
 
-        # Walk downward if ms-autoscroll-container is tall/virtualized
+        # 3. Walk turn-by-turn so long turns (80k+ px) don't exhaust a fixed scroll cap
+        turn_count_raw = await page.evaluate(
+            "() => document.querySelectorAll('ms-chat-turn').length"
+        )
+        turn_count = int(turn_count_raw) if isinstance(turn_count_raw, (int, float)) else 0
+        if turn_count > 0:
+            step = max(1, (turn_count + 59) // 60)
+            indices = list(range(0, turn_count, step))
+            if (turn_count - 1) not in indices:
+                indices.append(turn_count - 1)
+            for idx in indices:
+                await page.evaluate(
+                    """(i) => {
+                        const ts = document.querySelectorAll('ms-chat-turn');
+                        const el = ts[i];
+                        if (el && typeof el.scrollIntoView === 'function') {
+                            el.scrollIntoView({ block: 'center' });
+                        }
+                        document.querySelectorAll(
+                            'ms-thought-chunk mat-expansion-panel-header[aria-expanded="false"]'
+                        ).forEach(hdr => hdr.click());
+                    }""",
+                    idx,
+                )
+                await asyncio.sleep(0.25)
+                _absorb(await page.evaluate(_AISTUDIO_HARVEST_JS))
+
+        # 4. Also walk ms-autoscroll-container cleanly to bottom if virtualized
         prev_top = -1
         for _ in range(40):
             scroll_info = await page.evaluate(
@@ -1404,7 +1796,8 @@ async def _extract_aistudio_from_page(
                     if (!sc || sc.scrollHeight <= sc.clientHeight + 20) {
                         return { top: 0, height: 0, client: 0 };
                     }
-                    sc.scrollTop = sc.scrollTop + Math.max(300, sc.clientHeight * 0.75);
+                    const jump = Math.max(300, sc.scrollHeight / 20, sc.clientHeight * 0.75);
+                    sc.scrollTop = sc.scrollTop + jump;
                     document.querySelectorAll(
                         'ms-thought-chunk mat-expansion-panel-header[aria-expanded="false"]'
                     ).forEach(hdr => hdr.click());
@@ -1413,7 +1806,7 @@ async def _extract_aistudio_from_page(
             )
             if not isinstance(scroll_info, dict) or scroll_info.get("height", 0) == 0:
                 break
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.35)
             _absorb(await page.evaluate(_AISTUDIO_HARVEST_JS))
             at_bottom = (
                 scroll_info.get("top", 0) + scroll_info.get("client", 0)
@@ -1455,8 +1848,21 @@ async def _extract_aistudio_from_page(
                 att_lines.append(f"[Attachment: {label}" + (f" ({extra})]" if extra else "]"))
             messages.append({"role": role, "kind": "attachment", "content": "\n".join(att_lines)})
 
+    clean_hint = _clean_aistudio_title(title_hint)
+    # Prefer full Library hint if docTitle is truncated (~30 chars) prefix of hint
+    if clean_hint and (
+        not extracted_title
+        or (
+            len(clean_hint) > len(extracted_title)
+            and clean_hint.lower().startswith(extracted_title.lower())
+        )
+    ):
+        final_title = clean_hint
+    else:
+        final_title = extracted_title or clean_hint or "Google AI Studio"
+
     return {
-        "title": extracted_title or _strip_directional_chars(title_hint) or "Google AI Studio",
+        "title": final_title,
         "messages": messages,
         "attachments": list(attachments_map.values()),
     }
@@ -1466,9 +1872,14 @@ async def _sync_aistudio_page(
     page: Any,
     max_chats: int,
     base_dir: Path | str | None,
+    skip_existing: bool = False,
+    offset: int = 0,
+    deadline_ts: float | None = None,
+    skipped_out: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Scrapes Google AI Studio saved prompts library (aistudio.google.com/library)."""
     _log_progress(f"Starting AI Studio sync (max_chats={max_chats})...")
+    skipped: list[dict[str, Any]] = skipped_out if skipped_out is not None else []
     await page.goto("https://aistudio.google.com/library", wait_until="domcontentloaded")
     await asyncio.sleep(3.0)
 
@@ -1484,7 +1895,9 @@ async def _sync_aistudio_page(
                 if (row) {
                     const cells = Array.from(row.querySelectorAll('td, [role="cell"]'));
                     if (cells.length >= 2) {
-                        updatedText = (cells[1].innerText || '').trim();
+                        updatedText = (
+                            cells[1].getAttribute('title') || cells[1].innerText || ''
+                        ).trim();
                     }
                 }
                 if (m && !href.endsWith('/new_chat')) {
@@ -1509,8 +1922,17 @@ async def _sync_aistudio_page(
 
     _log_progress(f"[aistudio] Found {len(unique_links)} prompt(s); syncing up to {max_chats}...")
     synced: list[dict[str, Any]] = []
-    targets = unique_links[:max_chats]
+    targets = unique_links[offset : offset + max_chats]
     for idx, item in enumerate(targets, start=1):
+        if deadline_ts and time.time() >= deadline_ts:
+            _log_progress(
+                f"[aistudio] Time budget reached after {idx - 1}/{len(targets)} prompt(s)."
+            )
+            break
+        cid = f"aistudio_{item['id']}"
+        if skip_existing and chat_exists_complete(cid, base_dir=base_dir):
+            skipped.append({"chat_id": cid, "reason": "already_synced"})
+            continue
         _log_progress(f"[aistudio] ({idx}/{len(targets)}) {item['id']}")
         try:
             await page.goto(item["url"], wait_until="domcontentloaded", timeout=20000)
@@ -1520,7 +1942,7 @@ async def _sync_aistudio_page(
             if parsed["messages"]:
                 synced.append(
                     upsert_chat(
-                        chat_id=f"aistudio_{item['id']}",
+                        chat_id=cid,
                         title=parsed["title"][:80],
                         messages=parsed["messages"],
                         source="browser_aistudio",
@@ -1531,6 +1953,8 @@ async def _sync_aistudio_page(
                         attachments=parsed.get("attachments") or None,
                     )
                 )
+            else:
+                skipped.append({"chat_id": cid, "reason": "empty_messages_or_unrendered"})
         except Exception as exc:
             synced.append({"chat_id": item["id"], "error": str(exc)})
     _log_progress(
@@ -1543,9 +1967,14 @@ async def _sync_notebooklm_page(
     page: Any,
     max_chats: int,
     base_dir: Path | str | None,
+    skip_existing: bool = False,
+    offset: int = 0,
+    deadline_ts: float | None = None,
+    skipped_out: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Scrapes NotebookLM notebooks and chat notes (notebooklm.google.com)."""
     _log_progress(f"Starting NotebookLM sync (max_chats={max_chats})...")
+    skipped: list[dict[str, Any]] = skipped_out if skipped_out is not None else []
     await page.goto("https://notebooklm.google.com/", wait_until="domcontentloaded")
     await asyncio.sleep(3.0)
 
@@ -1573,8 +2002,17 @@ async def _sync_notebooklm_page(
 
     _log_progress(f"[notebooklm] Found {len(unique_nbs)} notebook(s); syncing up to {max_chats}...")
     synced: list[dict[str, Any]] = []
-    targets = unique_nbs[:max_chats]
+    targets = unique_nbs[offset : offset + max_chats]
     for idx, nb in enumerate(targets, start=1):
+        if deadline_ts and time.time() >= deadline_ts:
+            _log_progress(
+                f"[notebooklm] Time budget reached after {idx - 1}/{len(targets)} notebook(s)."
+            )
+            break
+        cid = f"notebooklm_{nb['id']}"
+        if skip_existing and chat_exists_complete(cid, base_dir=base_dir):
+            skipped.append({"chat_id": cid, "reason": "already_synced"})
+            continue
         _log_progress(f"[notebooklm] ({idx}/{len(targets)}) {nb['id']}")
         try:
             await page.goto(nb["url"], wait_until="domcontentloaded", timeout=20000)
@@ -1588,7 +2026,7 @@ async def _sync_notebooklm_page(
             if content:
                 synced.append(
                     upsert_chat(
-                        chat_id=f"notebooklm_{nb['id']}",
+                        chat_id=cid,
                         title=nb["title"][:80],
                         messages=[{"role": "assistant", "content": content}],
                         source="browser_notebooklm",
@@ -1596,6 +2034,8 @@ async def _sync_notebooklm_page(
                         base_dir=base_dir,
                     )
                 )
+            else:
+                skipped.append({"chat_id": cid, "reason": "empty_messages_or_unrendered"})
         except Exception as exc:
             synced.append({"chat_id": nb["id"], "error": str(exc)})
     _log_progress(
@@ -1625,6 +2065,25 @@ def _parse_myactivity_dialog_text(
         "apps",
         "chat",
         "search",
+        "devices_other",
+        "location_on",
+        "info_filled",
+        "open_in_new",
+        "public",
+        "schedule",
+        "history",
+        "arrow_forward",
+    }
+    device_names = {
+        "Windows",
+        "Android",
+        "iPhone",
+        "iPad",
+        "Mac",
+        "macOS",
+        "Linux",
+        "Chrome",
+        "ChromeOS",
     }
     footer_markers = ("Why this activity?", "If you use a shared device")
 
@@ -1632,9 +2091,17 @@ def _parse_myactivity_dialog_text(
     time_text = ""
     body_lines: list[str] = []
     seen_details = False
+    after_device_icon = False
     for ln in lines:
         if any(ln.startswith(m) for m in footer_markers):
             break
+        if ln == "devices_other":
+            after_device_icon = True
+            continue
+        if after_device_icon and ln in device_names:
+            after_device_icon = False
+            continue
+        after_device_icon = False
         if ln in skip_headers:
             if ln == "Details":
                 seen_details = True
@@ -1690,6 +2157,8 @@ async def _sync_myactivity_page(
     page: Any,
     max_chats: int,
     base_dir: Path | str | None,
+    offset: int = 0,
+    deadline_ts: float | None = None,
 ) -> list[dict[str, Any]]:
     """Scrapes Google's central My Activity hub (myactivity.google.com/product/gemini & search)."""
     _log_progress(f"Starting My Activity sync (max_chats={max_chats})...")
@@ -1699,12 +2168,14 @@ async def _sync_myactivity_page(
     ]
     synced: list[dict[str, Any]] = []
     for url, src_tag in urls:
+        if deadline_ts and time.time() >= deadline_ts:
+            break
         _log_progress(f"[myactivity] Scanning {src_tag} ({url})...")
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(2.5)
             cards = await page.evaluate(
-                r"""(maxItems) => {
+                r"""(maxItems, isSearchSurface) => {
                     const out = [];
                     const els = document.querySelectorAll(
                         'c-wiz [role="listitem"], [data-date] [role="region"], article'
@@ -1715,7 +2186,10 @@ async def _sync_myactivity_page(
                         if (out.length >= maxItems) return;
                         const txt = (el.innerText || '').trim();
                         if (!txt || /Cleared previous feedback/i.test(txt)) return;
-                        if (/prompted|asked|ai mode|gemini|searched for/i.test(txt)) {
+                        const isAiEntry = isSearchSurface
+                            ? /asked in ai mode|ai mode|ai overview|prompted/i.test(txt)
+                            : /prompted|asked|ai mode|gemini|searched for/i.test(txt);
+                        if (isAiEntry) {
                             let lines = txt.split('\n').map(l => l.trim()).filter(Boolean);
                             while (lines.length > 1 && badges.test(lines[0])) {
                                 lines.shift();
@@ -1732,7 +2206,6 @@ async def _sync_myactivity_page(
                             }
                             const dateHolder = el.closest('[data-date]');
                             const dataDate = dateHolder?.getAttribute('data-date') || '';
-                            const markerAttr = `data-gah-idx="${idx}"`;
                             el.setAttribute('data-gah-idx', String(idx));
                             const hasDetailsBtn = !!el.querySelector(
                                 'a.WFTFcf, a[aria-label*="details" i], ' +
@@ -1750,11 +2223,17 @@ async def _sync_myactivity_page(
                     });
                     return out;
                 }""",
-                max_chats,
+                max_chats + offset,
+                src_tag == "myactivity_search_ai",
             )
 
             _log_progress(f"[myactivity:{src_tag}] Found {len(cards)} entry card(s).")
-            for card_num, card in enumerate(cards[:max_chats], start=1):
+            for card_num, card in enumerate(cards[offset : offset + max_chats], start=1):
+                if deadline_ts and time.time() >= deadline_ts:
+                    _log_progress(
+                        f"[myactivity:{src_tag}] Time budget reached at card {card_num - 1}."
+                    )
+                    break
                 title_clean = re.sub(
                     r"^(Prompted|Asked in AI Mode|Asked|Searched for)\s*:?\s*",
                     "",
@@ -1770,6 +2249,16 @@ async def _sync_myactivity_page(
 
                 if card.get("hasDetailsBtn") and card.get("idx") is not None:
                     try:
+                        # Ensure any previously closing dialog is gone before opening next
+                        for _ in range(6):
+                            dlg_open = await page.evaluate(
+                                "() => !!document.querySelector("
+                                '\'[role="dialog"], [aria-modal="true"]\')'
+                            )
+                            if not dlg_open:
+                                break
+                            await asyncio.sleep(0.15)
+
                         clicked = await page.evaluate(
                             """(idx) => {
                                 const el = document.querySelector(`[data-gah-idx="${idx}"]`);
@@ -1779,6 +2268,9 @@ async def _sync_myactivity_page(
                                     'button[aria-label*="details" i]'
                                 );
                                 if (!btn) return false;
+                                if (typeof btn.scrollIntoView === 'function') {
+                                    btn.scrollIntoView({ block: 'center' });
+                                }
                                 btn.click();
                                 return true;
                             }""",
@@ -1786,7 +2278,7 @@ async def _sync_myactivity_page(
                         )
                         if clicked:
                             dialog_data = None
-                            for _ in range(10):
+                            for _ in range(12):
                                 await asyncio.sleep(0.25)
                                 dialog_data = await page.evaluate(
                                     """() => {
@@ -1803,8 +2295,12 @@ async def _sync_myactivity_page(
                                         };
                                     }"""
                                 )
-                                if isinstance(dialog_data, dict) and dialog_data.get("text"):
-                                    break
+                                if isinstance(dialog_data, dict):
+                                    txt_now = str(dialog_data.get("text") or "")
+                                    if "Why this activity?" in txt_now or (
+                                        txt_now and "Item details" not in txt_now
+                                    ):
+                                        break
                             if isinstance(dialog_data, dict) and dialog_data.get("text"):
                                 parsed_dlg = _parse_myactivity_dialog_text(
                                     dialog_data["text"],
@@ -1828,7 +2324,7 @@ async def _sync_myactivity_page(
                                     if (closeBtn) closeBtn.click();
                                 }"""
                             )
-                            await asyncio.sleep(0.15)
+                            await asyncio.sleep(0.2)
                     except Exception:
                         pass
 
@@ -1849,29 +2345,33 @@ async def _sync_myactivity_page(
                         }
                     )
 
-                hash_seed = (
-                    f"{src_tag}:{source_chat_id or ''}:{iso_ts or card_num}:"
-                    f"{prompt_full}:{response_full[:80]}"
-                )
+                norm_p = re.sub(r"\s+", " ", prompt_full).strip()[:120]
+                hash_seed = f"{src_tag}:{source_chat_id or ''}:{iso_ts or card_num}:{norm_p}"
                 cid_hash = hashlib.sha1(hash_seed.encode()).hexdigest()[:14]
-                synced.append(
-                    upsert_chat(
-                        chat_id=f"{src_tag}_{cid_hash}",
-                        title=(prompt_full[:80] or "Google AI Activity"),
-                        messages=msgs,
-                        source=src_tag,
-                        url=entry_url,
-                        created_at=iso_ts,
-                        updated_at=iso_ts,
-                        base_dir=base_dir,
-                        source_chat_id=source_chat_id,
-                    )
+                chat_id = f"{src_tag}_{cid_hash}"
+                saved = upsert_chat(
+                    chat_id=chat_id,
+                    title=(prompt_full[:80] or "Google AI Activity"),
+                    messages=msgs,
+                    source=src_tag,
+                    url=entry_url,
+                    created_at=iso_ts,
+                    updated_at=iso_ts,
+                    base_dir=base_dir,
+                    source_chat_id=source_chat_id,
                 )
+                delete_superseded_myactivity_stubs(
+                    source=src_tag,
+                    prompt_full=prompt_full,
+                    source_chat_id=source_chat_id,
+                    keep_chat_id=chat_id,
+                    base_dir=base_dir,
+                )
+                synced.append(saved)
         except Exception as exc:
             synced.append({"url": url, "error": str(exc)})
-    _log_progress(
-        f"[myactivity] Completed: {len([r for r in synced if 'markdown_path' in r])} synced."
-    )
+    unique_synced = {r["chat_id"] for r in synced if "markdown_path" in r and r.get("chat_id")}
+    _log_progress(f"[myactivity] Completed: {len(unique_synced)} unique chat(s) synced.")
     return synced
 
 
@@ -1901,6 +2401,9 @@ async def sync_from_browser(
     cdp_url: str = "http://127.0.0.1:9222",
     target: str = "gemini",
     base_dir: Path | str | None = None,
+    skip_existing: bool = False,
+    offset: int = 0,
+    time_budget_sec: int | None = None,
 ) -> dict[str, Any]:
     """Connects to Chrome over CDP and syncs across Google AI surfaces."""
     from playwright.async_api import async_playwright
@@ -1909,6 +2412,8 @@ async def sync_from_browser(
         return {"error": f"Unsupported target '{target}'. Choose from {SUPPORTED_TARGETS}."}
 
     paths = ensure_dirs(base_dir)
+    start_ts = time.time()
+    deadline_ts = (start_ts + time_budget_sec) if time_budget_sec and time_budget_sec > 0 else None
 
     async with async_playwright() as p:
         browser = None
@@ -1985,10 +2490,14 @@ async def sync_from_browser(
             }
 
         synced_results: list[dict[str, Any]] = []
+        skipped_all: list[dict[str, Any]] = []
         surfaces: dict[str, dict[str, Any]] = {}
 
-        def _record_surface(name: str, items: list[dict[str, Any]]) -> None:
+        def _record_surface(
+            name: str, items: list[dict[str, Any]], surf_skipped: list[dict[str, Any]]
+        ) -> None:
             synced_results.extend(items)
+            skipped_all.extend(surf_skipped)
             errs = [
                 {k: v for k, v in r.items() if k in ("chat_id", "url", "error")}
                 for r in items
@@ -1997,22 +2506,72 @@ async def sync_from_browser(
             unique_ok = {r["chat_id"] for r in items if "markdown_path" in r and r.get("chat_id")}
             surfaces[name] = {
                 "synced_count": len(unique_ok),
+                "skipped_count": len(surf_skipped),
                 "error_count": len(errs),
                 "errors": errs[:20],
             }
 
-        if target in ("gemini", "all"):
-            _record_surface("gemini", await _sync_gemini_app_page(page, max_chats, base_dir))
-        if target in ("aimode", "all"):
-            _record_surface("aimode", await _sync_search_ai_mode_page(page, max_chats, base_dir))
-        if target in ("aistudio", "all"):
-            _record_surface("aistudio", await _sync_aistudio_page(page, max_chats, base_dir))
-        if target in ("notebooklm", "all"):
-            _record_surface("notebooklm", await _sync_notebooklm_page(page, max_chats, base_dir))
-        if target in ("myactivity", "all"):
-            ma_items = await _sync_myactivity_page(page, max_chats, base_dir)
-            _record_surface("myactivity", ma_items)
-            if target == "all":
+        def _budget_left() -> bool:
+            return deadline_ts is None or time.time() < deadline_ts
+
+        if target in ("gemini", "all") and _budget_left():
+            sk: list[dict[str, Any]] = []
+            res_gem = await _sync_gemini_app_page(
+                page,
+                max_chats,
+                base_dir,
+                skip_existing=skip_existing,
+                offset=offset,
+                deadline_ts=deadline_ts,
+                skipped_out=sk,
+            )
+            _record_surface("gemini", res_gem, sk)
+        if target in ("aimode", "all") and _budget_left():
+            sk = []
+            res_ai = await _sync_search_ai_mode_page(
+                page,
+                max_chats,
+                base_dir,
+                skip_existing=skip_existing,
+                offset=offset,
+                deadline_ts=deadline_ts,
+                skipped_out=sk,
+            )
+            _record_surface("aimode", res_ai, sk)
+        if target in ("aistudio", "all") and _budget_left():
+            sk = []
+            res_ais = await _sync_aistudio_page(
+                page,
+                max_chats,
+                base_dir,
+                skip_existing=skip_existing,
+                offset=offset,
+                deadline_ts=deadline_ts,
+                skipped_out=sk,
+            )
+            _record_surface("aistudio", res_ais, sk)
+        if target in ("notebooklm", "all") and _budget_left():
+            sk = []
+            res_nb = await _sync_notebooklm_page(
+                page,
+                max_chats,
+                base_dir,
+                skip_existing=skip_existing,
+                offset=offset,
+                deadline_ts=deadline_ts,
+                skipped_out=sk,
+            )
+            _record_surface("notebooklm", res_nb, sk)
+        if target in ("myactivity", "all") and _budget_left():
+            ma_items = await _sync_myactivity_page(
+                page,
+                max_chats,
+                base_dir,
+                offset=offset,
+                deadline_ts=deadline_ts,
+            )
+            _record_surface("myactivity", ma_items, [])
+            if target == "all" and _budget_left():
                 known_gem_ids = {
                     r.get("chat_id")
                     for r in synced_results
@@ -2042,13 +2601,17 @@ async def sync_from_browser(
                         f"[gemini] Backfilling {min(len(discovered_gemini), remaining)} "
                         f"thread(s) discovered via My Activity..."
                     )
+                    sk = []
                     extra_res = await _sync_gemini_app_page(
                         page,
                         remaining,
                         base_dir,
                         extra_chats=discovered_gemini,
+                        skip_existing=skip_existing,
+                        deadline_ts=deadline_ts,
+                        skipped_out=sk,
                     )
-                    _record_surface("gemini_from_myactivity", extra_res)
+                    _record_surface("gemini_from_myactivity", extra_res, sk)
 
         deduped_chats: list[dict[str, Any]] = []
         seen_result_idx: dict[str, int] = {}
@@ -2064,13 +2627,117 @@ async def sync_from_browser(
             else:
                 deduped_chats.append(r)
 
-        return {
+        partial = bool(deadline_ts and time.time() >= deadline_ts)
+        synced_count = len([r for r in deduped_chats if "markdown_path" in r])
+        payload: dict[str, Any] = {
             "status": "ok",
             "target": target,
-            "synced_count": len([r for r in deduped_chats if "markdown_path" in r]),
+            "partial": partial,
+            "elapsed_sec": round(time.time() - start_ts, 2),
+            "synced_count": synced_count,
+            "skipped_count": len(skipped_all),
+            "skipped": skipped_all[:100],
             "surfaces": surfaces,
             "synced_chats": deduped_chats,
         }
+        if partial:
+            payload["next_offset"] = offset + synced_count + len(skipped_all)
+        return payload
+
+
+def start_sync_job(
+    max_chats: int = 50,
+    login_timeout_sec: int = 180,
+    cdp_url: str = "http://127.0.0.1:9222",
+    target: str = "gemini",
+    base_dir: Path | str | None = None,
+    skip_existing: bool = False,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Starts a non-blocking background browser sync job and returns job_id immediately."""
+    job_id = uuid.uuid4().hex[:12]
+    job: dict[str, Any] = {
+        "job_id": job_id,
+        "status": "running",
+        "target": target,
+        "started_at": datetime.now(UTC).isoformat(),
+        "started_monotonic": time.time(),
+        "progress": [],
+        "result": None,
+        "error": None,
+    }
+    _SYNC_JOBS[job_id] = job
+
+    async def _runner() -> None:
+        global _ACTIVE_PROGRESS_CB
+
+        def _capture(line: str) -> None:
+            prog: list[str] = job["progress"]
+            prog.append(line)
+            if len(prog) > 50:
+                del prog[:-50]
+
+        prev_cb = _ACTIVE_PROGRESS_CB
+        _ACTIVE_PROGRESS_CB = _capture
+        try:
+            res = await sync_from_browser(
+                max_chats=max_chats,
+                login_timeout_sec=login_timeout_sec,
+                cdp_url=cdp_url,
+                target=target,
+                base_dir=base_dir,
+                skip_existing=skip_existing,
+                offset=offset,
+                time_budget_sec=None,
+            )
+            job["result"] = res
+            job["status"] = "completed"
+        except Exception as exc:
+            job["error"] = str(exc)
+            job["status"] = "error"
+        finally:
+            _ACTIVE_PROGRESS_CB = prev_cb
+
+    asyncio.create_task(_runner())
+    return {
+        "status": "started",
+        "job_id": job_id,
+        "target": target,
+        "message": "Background sync started. Poll get_sync_status(job_id) for progress.",
+    }
+
+
+def get_sync_job_status(job_id: str | None = None) -> dict[str, Any]:
+    """Returns progress and results for a background sync job (or lists all jobs)."""
+    if job_id is None:
+        return {
+            "jobs": [
+                {
+                    "job_id": j["job_id"],
+                    "status": j["status"],
+                    "target": j["target"],
+                    "started_at": j["started_at"],
+                    "elapsed_sec": round(time.time() - j["started_monotonic"], 2),
+                }
+                for j in _SYNC_JOBS.values()
+            ]
+        }
+    job = _SYNC_JOBS.get(job_id)
+    if not job:
+        return {"error": f"Unknown job_id '{job_id}'"}
+    out: dict[str, Any] = {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "target": job["target"],
+        "started_at": job["started_at"],
+        "elapsed_sec": round(time.time() - job["started_monotonic"], 2),
+        "progress": list(job["progress"][-20:]),
+    }
+    if job["result"] is not None:
+        out["result"] = job["result"]
+    if job["error"] is not None:
+        out["error"] = job["error"]
+    return out
 
 
 def _detect_url_surface_and_id(url: str) -> tuple[str, str]:
@@ -2320,7 +2987,14 @@ def check_system_health(
     cdp_url: str = "http://127.0.0.1:9222",
 ) -> dict[str, Any]:
     """Checks system prerequisites, dependencies, Chrome/CDP status, and real auth cookie state."""
+    from google_ai_history.db import get_conn
+
     paths = ensure_dirs(base_dir)
+    if paths["db"].is_file():
+        try:
+            get_conn(base_dir).close()
+        except Exception:
+            pass
     py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     py_ok = sys.version_info >= (3, 11)
 

@@ -13,12 +13,14 @@ from google_ai_history.cli import main as cli_main
 from google_ai_history.importers import (
     _canonicalize_aimode_url,
     _check_registered_mcp_configs,
+    _clean_aistudio_title,
     _clean_gemini_title,
     _detect_url_surface_and_id,
     _extract_aistudio_from_page,
     _extract_gemini_chat_from_page,
     _fetch_public_share_via_http,
     _harvest_gemini_turns_from_page,
+    _html_to_markdown,
     _launch_chrome_visible,
     _normalize_google_ai_url,
     _parse_myactivity_dialog_text,
@@ -956,7 +958,28 @@ async def test_error_paths_timestamps_and_mcp_config_edges(
         side_effect=[
             True,  # auth check
             True,  # has_turns
+            {
+                "pageTitle": "AI Studio Direct",
+                "turns": [
+                    {
+                        "id": "t1",
+                        "role": "user",
+                        "text": "Hello",
+                        "thought": "",
+                        "attachments": [],
+                    },
+                    {
+                        "id": "t2",
+                        "role": "assistant",
+                        "text": "",
+                        "thought": "",
+                        "attachments": [],
+                    },
+                ],
+                "attachments": [],
+            },  # initial harvest before scroll
             None,  # scroll to top
+            True,  # fc_ready
             {
                 "pageTitle": "AI Studio Direct",
                 "turns": [
@@ -976,8 +999,13 @@ async def test_error_paths_timestamps_and_mcp_config_edges(
                     },
                 ],
                 "attachments": [],
-            },
-            {"top": 0, "height": 0, "client": 0},
+            },  # after scroll top
+            2,  # turn count
+            None,  # scrollIntoView idx 0
+            None,  # harvest idx 0
+            None,  # scrollIntoView idx 1
+            None,  # harvest idx 1
+            {"top": 0, "height": 0, "client": 0},  # autoscroll container
         ]
     )
     mock_ctx = MagicMock()
@@ -1005,3 +1033,137 @@ async def test_error_paths_timestamps_and_mcp_config_edges(
             base_dir=tmp_path,
         )
         assert empty_res["reason"] == "selector_miss_or_empty_thread"
+
+
+@pytest.mark.asyncio
+async def test_retest_round2_markdown_inplace_merge_and_skip_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    # 1. HTML -> Markdown conversion + AI Studio title cleaning + device line strip
+    md = _html_to_markdown(
+        "<response-element><structured-content>"
+        "<h1>Report Title</h1><p>Intro <strong>bold</strong> "
+        "<span class='katex'><math><semantics><mrow>80%</mrow>"
+        "<annotation>80\\%</annotation></semantics></math></span>.</p>"
+        "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>"
+        "<ul><li>First</li><li>Second</li></ul>"
+        "</structured-content></response-element>"
+    )
+    assert "# Report Title\n\nIntro" in md
+    assert "80%" in md and "80\\%" not in md
+    assert "**bold**" in md
+    assert "| A | B |" in md
+    assert "- First" in md
+
+    assert _clean_aistudio_title("Playground") == ""
+    assert _clean_aistudio_title("Fantasy Football Free Agent Cl | Google AI Studio") == (
+        "Fantasy Football Free Agent Cl"
+    )
+
+    dlg_devices = _parse_myactivity_dialog_text(
+        "Item details\nGemini Apps\nPrompted Best MFL tools\nDetails\n"
+        "event\nNovember 3 at 1:00 PM\ndevices_other\nWindows\n"
+        "Use the export API.\nWhy this activity?",
+        [],
+        "fallback",
+    )
+    assert dlg_devices["response"] == "Use the export API."
+
+    # 2. In-place prefix merge in _harvest_gemini_turns_from_page (no duplicate/out-of-order turns)
+    win_idx = 0
+    windows = [
+        [
+            {"role": "user", "content": "Do deep research"},
+            {"role": "assistant", "content": "Here's the plan I've put together for MFL."},
+        ],
+        [
+            {
+                "role": "assistant",
+                "content": (
+                    "Here's the plan I've put together for MFL.\n\nStep 1: Export endpoints."
+                ),
+            },
+            {"role": "user", "content": "Start research"},
+        ],
+    ]
+
+    async def _eval_merge(script: str, frac: float = 0.0) -> Any:
+        nonlocal win_idx
+        if "infinite-scroller.chat-history" in script:
+            if frac < 0:
+                return {"top": 0, "height": 1000, "client": 500}
+            return {"top": 500 if win_idx <= 1 else 1000, "height": 1000, "client": 500}
+        cur = windows[min(win_idx, len(windows) - 1)]
+        win_idx += 1
+        return cur
+
+    p_merge = MagicMock()
+    p_merge.evaluate = AsyncMock(side_effect=_eval_merge)
+    merged = await _harvest_gemini_turns_from_page(p_merge)
+    assert len(merged) == 3
+    assert merged[1]["role"] == "assistant"
+    assert "Step 1: Export endpoints." in merged[1]["content"]
+    assert merged[2]["content"] == "Start research"
+
+    # 3. skip_existing + skipped reporting in sync_from_browser
+    from google_ai_history.db import upsert_chat
+
+    upsert_chat(
+        chat_id="already_done_1",
+        title="Existing Chat",
+        messages=[{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hey"}],
+        source="browser_gemini",
+        base_dir=tmp_path,
+    )
+    mock_page = AsyncMock()
+    mock_page.url = "https://gemini.google.com/app"
+
+    def _eval_skip(script: Any, *args: Any) -> Any:
+        s = script if isinstance(script, str) else ""
+        if "autoClick" in s:
+            return True
+        if "side-nav-sparkle-button" in s:
+            return None
+        if "convSelector" in s:
+            return [
+                {
+                    "id": "already_done_1",
+                    "url": "https://gemini.google.com/app/already_done_1",
+                    "title": "Existing Chat",
+                },
+                {
+                    "id": "empty_chat_2",
+                    "url": "https://gemini.google.com/app/empty_chat_2",
+                    "title": "Empty Chat",
+                },
+            ]
+        if "didScroll" in s:
+            return False
+        if "user-query, model-response" in s and "length > 0" in s:
+            return True
+        if "hasDeepResearchCard" in s:
+            return {"pageTitle": "Empty Chat", "titleElText": "", "messages": []}
+        return None
+
+    mock_page.evaluate = AsyncMock(side_effect=_eval_skip)
+    mock_ctx = MagicMock()
+    mock_ctx.pages = [mock_page]
+    mock_br = MagicMock()
+    mock_br.contexts = [mock_ctx]
+    with patch("playwright.async_api.async_playwright") as mock_pw:
+        pw_inst = AsyncMock()
+        mock_pw.return_value.__aenter__.return_value = pw_inst
+        pw_inst.chromium.connect_over_cdp = AsyncMock(return_value=mock_br)
+        skip_res = await sync_from_browser(
+            target="gemini",
+            max_chats=10,
+            skip_existing=True,
+            base_dir=tmp_path,
+        )
+    assert skip_res["skipped_count"] == 2
+    reasons = {item["chat_id"]: item["reason"] for item in skip_res["skipped"]}
+    assert reasons["already_done_1"] == "already_synced"
+    assert reasons["empty_chat_2"] == "empty_messages_or_unrendered"

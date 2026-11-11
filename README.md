@@ -55,7 +55,8 @@ Google stores your AI interactions across **one central activity hub (`myactivit
 | `get_google_ai_chat` | `chat_id`, `login_timeout_sec=45` | Retrieves the full multi-turn conversation transcript and local `.md` file path by ID, partial title, or URL (automatically fetches live if the URL isn't cached yet). |
 | `search_google_ai_chats` | `query`, `limit=20` | Runs a fast SQLite FTS5 full-text search across all prompts and responses with highlighted snippets. |
 | `list_google_ai_chats` | `limit=50`, `offset=0`, `source=None` | Lists locally synced/imported Google AI chats (optionally filtered by `source`). |
-| `sync_google_ai_chats_from_browser` | `target="gemini"`, `max_chats=50`, `login_timeout_sec=180` | Attaches to Chrome over CDP (`port 9222`) and bulk-syncs threads from `'all'`, `'myactivity'`, `'gemini'`, `'aimode'`, `'aistudio'`, or `'notebooklm'`. |
+| `sync_google_ai_chats_from_browser` | `target="gemini"`, `max_chats=50`, `login_timeout_sec=180`, `skip_existing=False`, `offset=0`, `time_budget_sec=140`, `background=False` | Attaches to Chrome over CDP (`port 9222`) and syncs threads across surfaces. Use `background=True` + `get_sync_status(job_id)` for large syncs (`max_chats > 20` or `target="all"`). |
+| `get_sync_status` | `job_id=None` | Polls progress lines and final results for a background sync job started with `background=True`. |
 | `import_google_ai_takeout_or_files` | `path` | Imports a Google Takeout `.zip`, `MyActivity.json`, `MyActivity.html`, a `Google AI Studio` Drive folder, or exported JSON/Markdown files. |
 | `google_ai_history_auth_status` | *(none)* | Checks Python dependencies, Chrome/Edge path, and probes the SQLite `Cookies` DB in `chrome_profile` (`SID`, `SAPISID`, `__Secure-1PSID`, `__Secure-3PSID`) so AI agents know whether private URLs are ready or need one-time sign-in. |
 
