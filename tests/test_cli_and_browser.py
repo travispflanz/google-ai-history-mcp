@@ -587,6 +587,25 @@ def test_mcp_config_doctor_title_url_and_timestamps(tmp_path: Path) -> None:
     assert any("--directory" in i for i in checked[0]["issues"])
     assert checked[1]["ok"] is True
 
+    bare_win_cfg = tmp_path / "bare_win.json"
+    bare_win_cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "google-ai-history": {"command": "google-ai-history", "args": ["serve"]}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with (
+        patch("google_ai_history.importers.sys.platform", "win32"),
+        patch("google_ai_history.importers.shutil.which", return_value="C:/bin/gah.exe"),
+    ):
+        bare_checked = _check_registered_mcp_configs([bare_win_cfg])
+        assert bare_checked[0]["ok"] is True
+        assert any("0xffffffff" in w for w in bare_checked[0]["warnings"])
+
     # Title cleaning (Issue #6)
     assert (
         _clean_gemini_title("MFL Custom API Tools and Scripts - Google Gemini")

@@ -2934,6 +2934,7 @@ def _check_registered_mcp_configs(
             "configured": False,
             "ok": True,
             "issues": [],
+            "warnings": [],
         }
         try:
             raw = json.loads(cfg_path.read_text(encoding="utf-8", errors="replace"))
@@ -2965,6 +2966,15 @@ def _check_registered_mcp_configs(
         elif shutil.which(cmd) is None:
             entry_info["ok"] = False
             entry_info["issues"].append(f"Command '{cmd}' was not found on PATH.")
+        elif (
+            sys.platform == "win32"
+            and cmd.lower() not in ("uv", "python", "python3", "py")
+            and not cmd.lower().endswith(".exe")
+        ):
+            entry_info["warnings"].append(
+                f"Bare command '{cmd}' on Windows without .exe or 'uv run --directory' "
+                "can fail to spawn in Antigravity (exit status 0xffffffff)."
+            )
 
         if "--directory" in args:
             dir_idx = args.index("--directory")
@@ -3041,6 +3051,8 @@ def check_system_health(
         if not cfg.get("ok", True):
             for issue in cfg.get("issues", []):
                 recommendations.append(f"MCP config issue in {cfg['path']}: {issue}")
+        for warn in cfg.get("warnings", []):
+            recommendations.append(f"MCP config recommendation in {cfg['path']}: {warn}")
 
     return {
         "status": "ok" if (py_ok and all(deps.values()) and mcp_configs_ok) else "warning",

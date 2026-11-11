@@ -1,0 +1,74 @@
+name: Agent Issue Triage
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  triage-agent-report:
+    name: Triage and validate agent-report issue
+    if: >-
+      github.event.issue.author_association == 'OWNER' ||
+      contains(github.event.issue.labels.*.name, 'auto-fix') ||
+      startsWith(github.event.issue.title, '[Agent Report]') ||
+      startsWith(github.event.issue.title, '[Bug]')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Label and screen sanitized issue metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          IS_OWNER: ${{ github.event.issue.author_association == 'OWNER' }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          num = os.environ["ISSUE_NUMBER"]
+          title = os.environ.get("ISSUE_TITLE", "")
+          body = os.environ.get("ISSUE_BODY", "")
+          is_owner = os.environ.get("IS_OWNER", "false").lower() == "true"
+
+          labels_to_add = []
+          if "[agent report]" in title.lower():
+              labels_to_add.extend(["bug", "agent-report"])
+          elif "[bug]" in title.lower():
+              labels_to_add.append("bug")
+
+          if labels_to_add:
+              subprocess.run(
+                  ["gh", "issue", "edit", num, "--repo", repo, "--add-label", ",".join(labels_to_add)],
+                  check=False,
+              )
+
+          # Check whether any private session ID or email leaked into public issue text
+          warnings = []
+          if re.search(r"gemini\.google\.com/app/[a-f0-9]{12,}", body, re.I):
+              warnings.append("Detected what looks like a private `gemini.google.com/app/<id>` URL — consider redacting private session IDs.")
+          if re.search(r"\b[A-Za-z0-9._%+-]+@(?!example\.com\b)[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", body):
+              warnings.append("Detected an email address — consider redacting personal emails from public reports.")
+
+          if warnings:
+              msg = "### Privacy Pre-Check Warning\n" + "\n".join(f"- {w}" for w in warnings)
+              subprocess.run(
+                  ["gh", "issue", "comment", num, "--repo", repo, "--body", msg],
+                  check=False,
+              )
+
+          if is_owner:
+              print(f"Owner-authored issue #{num} queued for automated triage pickup.")
+          else:
+              print(f"Community issue #{num} labeled for maintainer review.")
+          PY
