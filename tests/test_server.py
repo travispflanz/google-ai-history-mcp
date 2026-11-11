@@ -7,10 +7,12 @@ import pytest
 from google_ai_history.server import (
     fetch_google_ai_chat_url,
     get_google_ai_chat,
+    get_sync_status,
     google_ai_history_auth_status,
     import_google_ai_takeout_or_files,
     list_google_ai_chats,
     search_google_ai_chats,
+    sync_google_ai_chats_from_browser,
 )
 
 
@@ -76,3 +78,23 @@ async def test_mcp_server_tools_end_to_end(
 
         direct_fetch = await fetch_google_ai_chat_url("https://gemini.google.com/app/abc_url_chat")
         assert direct_fetch["status"] == "ok"
+
+    # Test background sync job + get_sync_status
+    import asyncio
+
+    with patch(
+        "google_ai_history.importers.sync_from_browser",
+        new=AsyncMock(return_value={"status": "ok", "synced_count": 2}),
+    ):
+        started = await sync_google_ai_chats_from_browser(
+            target="gemini", max_chats=10, background=True
+        )
+        assert started["status"] == "started"
+        job_id = started["job_id"]
+        await asyncio.sleep(0.05)
+        status = get_sync_status(job_id)
+        assert status["status"] == "completed"
+        assert status["result"]["synced_count"] == 2
+        all_jobs = get_sync_status()
+        assert any(j["job_id"] == job_id for j in all_jobs["jobs"])
+        assert "error" in get_sync_status("unknown_job")

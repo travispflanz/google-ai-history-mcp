@@ -51,6 +51,9 @@ def main() -> None:
     )
     sync_p.add_argument("--max-chats", type=int, default=50)
     sync_p.add_argument("--timeout", type=int, default=180)
+    sync_p.add_argument("--skip-existing", action="store_true")
+    sync_p.add_argument("--offset", type=int, default=0)
+    sync_p.add_argument("--time-budget", type=int, default=None)
 
     imp_p = sub.add_parser(
         "import",
@@ -94,6 +97,9 @@ def main() -> None:
                 max_chats=args.max_chats,
                 login_timeout_sec=args.timeout,
                 target=args.target,
+                skip_existing=args.skip_existing,
+                offset=args.offset,
+                time_budget_sec=args.time_budget,
             )
         )
         print(json.dumps(res, indent=2))
