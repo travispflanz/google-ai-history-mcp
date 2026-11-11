@@ -1,7 +1,7 @@
 name: Bug / Google AI DOM Change Report (Human or AI Agent)
 description: Report a bug, missing prerequisite, or Google AI page DOM change discovered by a user or AI coding agent.
-title: "[Bug]: "
-labels: ["bug"]
+title: "[Agent Report]: "
+labels: ["bug", "agent-report"]
 body:
   - type: markdown
     attributes:

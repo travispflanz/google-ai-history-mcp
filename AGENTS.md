@@ -62,19 +62,25 @@ Read (or create) the user's harness MCP configuration file and merge the `"googl
 - **Cursor**: `~/.cursor/mcp.json`
 - **Claude Desktop / Claude Code**: `claude_desktop_config.json` or `~/.claude.json`
 
-**Recommended Configuration (Global `uv tool install` Binary — Survives Repo Moves & Avoids File Locks)**:
+**Recommended Configuration (Reliable Across Windows, macOS & Linux)**:
 ```json
 {
   "mcpServers": {
     "google-ai-history": {
-      "command": "google-ai-history",
-      "args": ["serve"],
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/google-ai-history-mcp",
+        "google-ai-history",
+        "serve"
+      ],
       "disabled": false
     }
   }
 }
 ```
-*(Alternatively, point `"command"` to the repo's `.venv\Scripts\google-ai-history.exe` on Windows or `.venv/bin/google-ai-history` on macOS/Linux.)*
+*(On Windows, prefer `"command": "uv"` with `"args": ["run", "--directory", "<repo-path>", "google-ai-history", "serve"]` or the full `.venv\Scripts\google-ai-history.exe` path — bare `"google-ai-history"` without `.exe` / `PATHEXT` resolution can return `exit status 0xffffffff` in Antigravity. On macOS/Linux, global `google-ai-history` from `uv tool install --editable . --force` also works cleanly.)*
 
 ### B. Install the Global Antigravity Skill (`SKILL.md`)
 For Google Antigravity users, also create `~/.gemini/config/skills/google-ai-history/SKILL.md` so future agent conversations automatically know when and how to invoke the `google-ai-history` MCP tools whenever the user drops a Google AI URL or asks about past chats.
@@ -118,13 +124,14 @@ If you (an AI agent) encounter an unexpected bug, missing dependency, edge case,
    - Include only: your agent harness name & OS/Python version, sanitized output of `google-ai-history doctor`, the exact traceback or selector change, and the fix/workaround you identified.
 2. **Check if the User Is Set Up with GitHub CLI (`gh auth status`)**:
    - **If `gh auth status` succeeds (GitHub CLI is authenticated)**:
-     - Ask the user for confirmation first:
-       > *"I encountered an issue in `google-ai-history-mcp` (and found a workaround). Since your GitHub CLI (`gh`) is authenticated, would you like me to submit a sanitized GitHub Issue (or Pull Request) to `travispflanz/google-ai-history-mcp` to help improve the MCP?"*
-     - Upon user approval, submit the issue automatically:
+     - Ask the user for confirmation first (or submit immediately if the user pre-authorized automatic issue filing):
+       > *"I encountered an issue in `google-ai-history-mcp`. Since your GitHub CLI (`gh`) is authenticated, would you like me to submit a sanitized `[Agent Report]` GitHub Issue to `travispflanz/google-ai-history-mcp`?"*
+     - Upon approval, submit with the `agent-report` + `bug` labels using a uniform structure so automated triage can parse it cleanly:
        ```bash
        gh issue create --repo travispflanz/google-ai-history-mcp \
-         --title "[Agent Report] <concise summary of issue>" \
-         --body "## Environment\n- Agent Harness: <name>\n- OS / Python: <os / python>\n\n## Issue & Traceback\n...\n\n## Suggested Fix / Workaround\n..."
+         --label "bug,agent-report" \
+         --title "[Agent Report]: <concise summary of issue>" \
+         --body "## Environment\n- Agent Harness: <name>\n- OS / Python: <os / python>\n- Commit: <git rev-parse --short HEAD>\n\n## Command / Tool & Expected vs Actual\n...\n\n## Sanitized Doctor / Traceback\n...\n\n## Suggested Fix / Workaround\n..."
        ```
    - **If `gh` is NOT installed or NOT authenticated**:
      - Do **not** force the user to install or log into GitHub. Simply include a brief note at the end of your response with a copy-pasteable summary and a pre-filled 1-click URL to [`https://github.com/travispflanz/google-ai-history-mcp/issues/new`](https://github.com/travispflanz/google-ai-history-mcp/issues/new) in case they want to report it.
@@ -150,3 +157,14 @@ When contributing improvements or fixes to this repository:
      gh pr merge --auto --squash --delete-branch
      gh pr checks --watch --fail-fast
      ```
+
+---
+
+## 7. Automated Issue Discovery & Triage Loop
+
+To auto-discover and fix `[Agent Report]` issues (e.g., via an Antigravity scheduled automation or manual triage pass):
+1. Query open owner-authored or `agent-report` issues that do not already have a linked open PR:
+   ```bash
+   gh issue list --repo travispflanz/google-ai-history-mcp --author travispflanz --state open --json number,title,body,labels
+   ```
+2. For each actionable issue, inspect the code on a fresh `fix/issue-<number>` branch from `main`, add a regression test, verify locally (and against Chrome CDP `127.0.0.1:9222` when browser DOM selectors are affected), run all 4 CI gates above, and open a PR with `Closes #<number>` and `gh pr merge --auto --squash --delete-branch`.

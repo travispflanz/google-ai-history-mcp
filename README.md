@@ -123,8 +123,12 @@ Merge the `"google-ai-history"` entry into `~/.gemini/config/mcp_config.json` (a
 {
   "mcpServers": {
     "google-ai-history": {
-      "command": "google-ai-history",
+      "command": "uv",
       "args": [
+        "run",
+        "--directory",
+        "/path/to/google-ai-history-mcp",
+        "google-ai-history",
         "serve"
       ],
       "disabled": false
@@ -132,7 +136,7 @@ Merge the `"google-ai-history"` entry into `~/.gemini/config/mcp_config.json` (a
   }
 }
 ```
-*(Install globally once with `uv tool install --editable . --force`, or point `"command"` to `/path/to/google-ai-history-mcp/.venv/Scripts/google-ai-history.exe` on Windows / `.venv/bin/google-ai-history` on macOS/Linux.)*
+*(**Windows Reliability Note:** Prefer `"command": "uv"` with `"args": ["run", "--directory", "<repo-path>", "google-ai-history", "serve"]` — or the full `.venv\Scripts\google-ai-history.exe` path — because spawning bare `"google-ai-history"` without `.exe` / `PATHEXT` resolution on Windows can fail with `exit status 0xffffffff` in Antigravity. On macOS/Linux, `"command": "google-ai-history"` from `uv tool install --editable . --force` also works cleanly.)*
 
 ### Step 4: How AI Agents Should Walk the User Through First-Time Activation
 1. **Refresh the MCP Server Panel**: After editing `mcp_config.json` in an active Antigravity session, instruct the user:
