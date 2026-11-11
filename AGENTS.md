@@ -37,14 +37,15 @@ Before running or registering `google-ai-history-mcp`, check the user's environm
 ## 2. Automated Repository Clone & Dependency Sync
 
 1. **Choose a persistent directory** inside the user's home or harness folder:
-   - **Google Antigravity (Windows)**: `C:\Users\<user>\.gemini\antigravity\scratch\google-ai-history-mcp`
-   - **macOS / Linux / Generic MCP**: `~/.gemini/antigravity/scratch/google-ai-history-mcp` or `~/.mcp/google-ai-history-mcp`
+   - **Google Antigravity (Windows)**: `C:\Users\<user>\.gemini\antigravity\projects\google-ai-history-mcp`
+   - **macOS / Linux / Generic MCP**: `~/.gemini/antigravity/projects/google-ai-history-mcp` or `~/.mcp/google-ai-history-mcp`
 2. **Clone, install, and run `doctor` health check**:
    ```bash
    git clone https://github.com/travispflanz/google-ai-history-mcp.git
    cd google-ai-history-mcp
    uv sync --all-groups
-   uv run google-ai-history doctor
+   uv tool install --editable . --force
+   google-ai-history doctor
    ```
    - **Note on Public Share Links (`share.gemini.google/...`, `gemini.google.com/share/...`, `g.co/gemini/share/...`)**: Public Gemini share links use a direct HTTP + RPC fast-path (`_fetch_public_share_via_http`) that extracts the full native Markdown conversation in **~1 second without Chrome or Google authentication**. In headless environments (like Hermes Agent, WSL, or Linux containers), `google-ai-history fetch <share_url>` works immediately out of the box!
 
@@ -61,31 +62,19 @@ Read (or create) the user's harness MCP configuration file and merge the `"googl
 - **Cursor**: `~/.cursor/mcp.json`
 - **Claude Desktop / Claude Code**: `claude_desktop_config.json` or `~/.claude.json`
 
-**Recommended Configuration (Direct `.venv` Binary — Avoids File Locks on Windows)**:
-- **Windows**:
-  ```json
-  {
-    "mcpServers": {
-      "google-ai-history": {
-        "command": "C:\\Users\\<user>\\.gemini\\antigravity\\scratch\\google-ai-history-mcp\\.venv\\Scripts\\google-ai-history.exe",
-        "args": ["serve"],
-        "disabled": false
-      }
+**Recommended Configuration (Global `uv tool install` Binary — Survives Repo Moves & Avoids File Locks)**:
+```json
+{
+  "mcpServers": {
+    "google-ai-history": {
+      "command": "google-ai-history",
+      "args": ["serve"],
+      "disabled": false
     }
   }
-  ```
-- **macOS / Linux**:
-  ```json
-  {
-    "mcpServers": {
-      "google-ai-history": {
-        "command": "/Users/<user>/.gemini/antigravity/scratch/google-ai-history-mcp/.venv/bin/google-ai-history",
-        "args": ["serve"],
-        "disabled": false
-      }
-    }
-  }
-  ```
+}
+```
+*(Alternatively, point `"command"` to the repo's `.venv\Scripts\google-ai-history.exe` on Windows or `.venv/bin/google-ai-history` on macOS/Linux.)*
 
 ### B. Install the Global Antigravity Skill (`SKILL.md`)
 For Google Antigravity users, also create `~/.gemini/config/skills/google-ai-history/SKILL.md` so future agent conversations automatically know when and how to invoke the `google-ai-history` MCP tools whenever the user drops a Google AI URL or asks about past chats.

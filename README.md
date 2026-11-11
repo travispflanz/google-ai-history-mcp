@@ -122,7 +122,7 @@ Merge the `"google-ai-history"` entry into `~/.gemini/config/mcp_config.json` (a
 {
   "mcpServers": {
     "google-ai-history": {
-      "command": "C:\\Users\\<your-username>\\.gemini\\antigravity\\scratch\\google-ai-history-mcp\\.venv\\Scripts\\google-ai-history.exe",
+      "command": "google-ai-history",
       "args": [
         "serve"
       ],
@@ -131,7 +131,7 @@ Merge the `"google-ai-history"` entry into `~/.gemini/config/mcp_config.json` (a
   }
 }
 ```
-*(On macOS/Linux, point `"command"` to `/path/to/google-ai-history-mcp/.venv/bin/google-ai-history` or use `"command": "uv"` with `"args": ["run", "--directory", "/path/to/google-ai-history-mcp", "google-ai-history", "serve"]`.)*
+*(Install globally once with `uv tool install --editable . --force`, or point `"command"` to `/path/to/google-ai-history-mcp/.venv/Scripts/google-ai-history.exe` on Windows / `.venv/bin/google-ai-history` on macOS/Linux.)*
 
 ### Step 4: How AI Agents Should Walk the User Through First-Time Activation
 1. **Refresh the MCP Server Panel**: After editing `mcp_config.json` in an active Antigravity session, instruct the user:

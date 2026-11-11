@@ -12,7 +12,7 @@ import time
 import urllib.parse
 import urllib.request
 import zipfile
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,11 +30,164 @@ SUPPORTED_TARGETS = (
 )
 
 
+def _log_progress(message: str) -> None:
+    """Writes live progress updates to stderr so stdout remains clean JSON for MCP."""
+    print(f"[google-ai-history] {message}", file=sys.stderr, flush=True)
+
+
 def _strip_directional_chars(text: str) -> str:
     """Strips invisible Unicode directional marks (e.g. LRM \\u200e) that break cp1252 consoles."""
     if not text:
         return ""
     return re.sub(r"[\u200b-\u200f\ufeff]", "", text).strip()
+
+
+def _clean_gemini_title(raw_title: str) -> str:
+    """Normalizes a Gemini page or sidebar title, stripping Google Gemini prefixes/suffixes."""
+    title = _strip_directional_chars(raw_title)
+    title = re.sub(r"^Gemini\s*[-–—]\s*", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s*[-–—]\s*(?:Google\s+)?Gemini$", "", title, flags=re.IGNORECASE)
+    title = title.strip()
+    if re.fullmatch(r"(?:Google\s+Gemini|Conversation\s+with\s+Gemini|Gemini)", title, re.I):
+        return ""
+    return title
+
+
+def _canonicalize_aimode_url(
+    url: str,
+    thread_id: str | None = None,
+    query: str | None = None,
+) -> str:
+    """Returns a stable Search AI Mode URL without ephemeral sxsrf/ved/mstk session params."""
+    u = _normalize_google_ai_url(url)
+    parsed = urllib.parse.urlsplit(u)
+    qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+
+    mtid = (qs.get("mtid") or [""])[0] or (thread_id or "")
+    if not mtid and parsed.fragment:
+        m_frag = re.search(r"thread=([a-zA-Z0-9_-]+)", parsed.fragment)
+        if m_frag:
+            mtid = m_frag.group(1)
+    q_val = (qs.get("q") or [""])[0] or (query or "")
+
+    params: list[tuple[str, str]] = [("udm", "50")]
+    if mtid:
+        params.append(("mtid", mtid))
+    if q_val:
+        params.append(("q", q_val))
+    return f"https://www.google.com/search?{urllib.parse.urlencode(params)}"
+
+
+def _parse_surface_timestamp(
+    raw: str | None,
+    data_date: str | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """Parses surface timestamps (ISO, data-date + time, 'Oct 26, 1:19 PM', relative) into UTC."""
+    ref_local = (now or datetime.now().astimezone()).astimezone()
+    text = _strip_directional_chars(raw or "")
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if text and re.match(r"^\d{4}-\d{2}-\d{2}[T\s]", text):
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            return dt.astimezone(UTC).isoformat()
+        except ValueError:
+            pass
+
+    # Relative times from AI Studio Library ("9 months ago", "2 days ago")
+    m_rel = re.match(
+        r"^(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m_rel:
+        qty = int(m_rel.group(1))
+        unit = m_rel.group(2).lower()
+        unit_days = {
+            "second": 0,
+            "minute": 0,
+            "hour": 0,
+            "day": 1,
+            "week": 7,
+            "month": 30,
+            "year": 365,
+        }
+        if unit == "second":
+            dt = ref_local - timedelta(seconds=qty)
+        elif unit == "minute":
+            dt = ref_local - timedelta(minutes=qty)
+        elif unit == "hour":
+            dt = ref_local - timedelta(hours=qty)
+        else:
+            dt = ref_local - timedelta(days=qty * unit_days[unit])
+        return dt.astimezone(UTC).isoformat()
+
+    # Extract optional time-of-day like "1:19 PM" or "11:02 AM"
+    m_time = re.search(r"(\d{1,2}):(\d{2})(?:\s*([AP]M))?", text, flags=re.IGNORECASE)
+    hour, minute = 0, 0
+    has_time = bool(m_time)
+    if m_time:
+        hour = int(m_time.group(1))
+        minute = int(m_time.group(2))
+        ampm = (m_time.group(3) or "").upper()
+        if ampm == "PM" and hour < 12:
+            hour += 12
+        elif ampm == "AM" and hour == 12:
+            hour = 0
+
+    if data_date and re.fullmatch(r"\d{8}", data_date.strip()):
+        try:
+            base = datetime.strptime(data_date.strip(), "%Y%m%d")
+            dt = base.replace(hour=hour, minute=minute, tzinfo=ref_local.tzinfo)
+            return dt.astimezone(UTC).isoformat()
+        except ValueError:
+            pass
+
+    if re.search(r"\b(Today|Yesterday)\b", text, flags=re.IGNORECASE):
+        day_offset = -1 if re.search(r"\bYesterday\b", text, flags=re.IGNORECASE) else 0
+        base_date = (ref_local + timedelta(days=day_offset)).date()
+        dt = datetime(
+            base_date.year,
+            base_date.month,
+            base_date.day,
+            hour,
+            minute,
+            tzinfo=ref_local.tzinfo,
+        )
+        return dt.astimezone(UTC).isoformat()
+
+    # Month + day + optional year ("Oct 26, 1:19 PM", "November 3 at 11:02 AM", "Nov 3, 2025")
+    m_md = re.search(
+        r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|"
+        r"Dec(?:ember)?)\s+(\d{1,2})(?:,?\s*(\d{4}))?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m_md:
+        mon_str = m_md.group(1)[:3].title()
+        day_num = int(m_md.group(2))
+        year_num = int(m_md.group(3)) if m_md.group(3) else ref_local.year
+        try:
+            parsed_month = datetime.strptime(mon_str, "%b").month
+            dt = datetime(
+                year_num,
+                parsed_month,
+                day_num,
+                hour if has_time else 0,
+                minute if has_time else 0,
+                tzinfo=ref_local.tzinfo,
+            )
+            if not m_md.group(3) and dt > ref_local + timedelta(days=1):
+                dt = dt.replace(year=year_num - 1)
+            return dt.astimezone(UTC).isoformat()
+        except ValueError:
+            pass
+
+    return None
 
 
 def _normalize_google_ai_url(url: str) -> str:
@@ -452,181 +605,360 @@ def find_chrome_executable() -> str | None:
     return None
 
 
+_GEMINI_EXTRACT_JS = """() => {
+    const messages = [];
+    const turnNodes = document.querySelectorAll(
+        'user-query, model-response, share-turn-viewer response-container, ' +
+        '[data-message-author-role], .conversation-container'
+    );
+    if (turnNodes.length > 0) {
+        turnNodes.forEach(node => {
+            const tag = node.tagName.toLowerCase();
+            const roleAttr = node.getAttribute('data-message-author-role');
+            if (tag === 'user-query' || roleAttr === 'user') {
+                const qEl = node.querySelector('.query-text, .user-query-text') || node;
+                const txt = (qEl.innerText || '')
+                    .replace(/^You said[^\\n]*\\n+/i, '')
+                    .replace(/^You said\\s*/i, '')
+                    .trim();
+                if (txt) messages.push({ role: 'user', content: txt });
+            } else if (
+                tag === 'model-response' ||
+                tag === 'response-container' ||
+                roleAttr === 'model'
+            ) {
+                const md = node.querySelector(
+                    'message-content, .markdown, .model-response-text'
+                ) || node;
+                const txt = (md.innerText || '')
+                    .replace(/^Gemini said\\s*/i, '')
+                    .trim();
+                if (txt) messages.push({ role: 'assistant', content: txt });
+            }
+        });
+    }
+    const titleEl = document.querySelector(
+        '[data-test-id="conversation-title"], .conversation-title:not(.picker-secondary-text)'
+    );
+    const rawDocTitle = (document.title || '').trim();
+    const rawElTitle = (titleEl?.innerText || '').trim();
+    const pageTitle = rawDocTitle || rawElTitle;
+    const hasDeepResearchCard = !!(
+        document.querySelector(
+            'deep-research-immersive-panel, immersive-panel, immersive-entry-chip, ' +
+            '[data-test-id*="immersive" i], [data-test-id*="research" i]'
+        ) ||
+        messages.some(m =>
+            m.role === 'assistant' &&
+            /I've completed your research\\./i.test(m.content || '')
+        )
+    );
+    return { pageTitle, titleElText: rawElTitle, messages, hasDeepResearchCard };
+}"""
+
+
+def _extract_gemini_card_timestamp(messages: list[dict[str, Any]]) -> str | None:
+    """Finds a date/time stamp like 'Oct 26, 1:19 PM' inside a Deep Research completion turn."""
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        lines = [ln.strip() for ln in str(msg.get("content") or "").splitlines() if ln.strip()]
+        for ln in reversed(lines[-3:]):
+            ts = _parse_surface_timestamp(ln)
+            if ts:
+                return ts
+    return None
+
+
+async def _extract_gemini_deep_research_report(page: Any) -> dict[str, Any]:
+    """Opens and scrapes Gemini's Deep Research immersive panel if present."""
+    panel_js = """() => {
+        const panel = document.querySelector(
+            'deep-research-immersive-panel, immersive-panel'
+        );
+        if (!panel) return null;
+        const container = panel.querySelector(
+            'message-content, .markdown, structured-content-container, response-element'
+        ) || panel;
+        const clone = container.cloneNode(true);
+        clone.querySelectorAll(
+            'button, mat-icon, .material-symbols-outlined, .material-icons, [aria-hidden="true"]'
+        ).forEach(el => el.remove());
+        const text = (clone.innerText || clone.textContent || '').trim();
+        return { text, length: text.length };
+    }"""
+
+    try:
+        panel_res = await page.evaluate(panel_js)
+        if isinstance(panel_res, dict) and (panel_res.get("text") or "").strip():
+            return {
+                "found_card": True,
+                "report": _strip_directional_chars(panel_res["text"]),
+            }
+
+        clicked = await page.evaluate(
+            """() => {
+                const chips = document.querySelectorAll(
+                    'immersive-entry-chip button, immersive-entry-chip [role="button"], ' +
+                    '[data-test-id*="immersive" i] button, model-response immersive-entry-chip'
+                );
+                for (const c of chips) {
+                    c.click();
+                    return true;
+                }
+                const btns = Array.from(
+                    document.querySelectorAll(
+                        'model-response button, model-response [role="button"]'
+                    )
+                );
+                const skipRe = new RegExp(
+                    '^(Copy|Edit|Good response|Bad response|' +
+                    'Share & export|Show more options|Edit plan|Start research)$',
+                    'i'
+                );
+                for (const b of btns) {
+                    const label = (b.getAttribute('aria-label') || b.innerText || '').trim();
+                    if (!label || skipRe.test(label)) continue;
+                    if (
+                        /research|open|view report/i.test(label) ||
+                        b.closest('immersive-entry-chip')
+                    ) {
+                        b.click();
+                        return true;
+                    }
+                }
+                return false;
+            }"""
+        )
+        if clicked:
+            for _ in range(8):
+                await asyncio.sleep(0.5)
+                panel_res = await page.evaluate(panel_js)
+                if isinstance(panel_res, dict) and (panel_res.get("text") or "").strip():
+                    return {
+                        "found_card": True,
+                        "report": _strip_directional_chars(panel_res["text"]),
+                    }
+            return {"found_card": True, "report": None}
+    except Exception:
+        pass
+    return {"found_card": False, "report": None}
+
+
+async def _extract_gemini_chat_from_page(
+    page: Any,
+    title_hint: str = "",
+) -> dict[str, Any]:
+    """Extracts turns, Deep Research report body, timestamps, and canonical title from Gemini."""
+    harvested = await _harvest_gemini_turns_from_page(page)
+    extracted = await page.evaluate(_GEMINI_EXTRACT_JS) or {}
+    if not isinstance(extracted, dict):
+        extracted = {}
+
+    msgs: list[dict[str, Any]] = (
+        list(harvested) if harvested else list(extracted.get("messages") or [])
+    )
+
+    dr_ts = _extract_gemini_card_timestamp(msgs)
+    if dr_ts and msgs:
+        for m in reversed(msgs):
+            if m.get("role") == "assistant" and not m.get("timestamp"):
+                m["timestamp"] = dr_ts
+                break
+
+    dr_info = await _extract_gemini_deep_research_report(page)
+    incomplete: str | None = None
+    has_dr_card = bool(extracted.get("hasDeepResearchCard") or dr_info.get("found_card"))
+    report_text = dr_info.get("report")
+    if report_text:
+        already_captured = any(report_text[:120] in str(m.get("content") or "") for m in msgs)
+        if not already_captured:
+            report_msg: dict[str, Any] = {
+                "role": "assistant",
+                "kind": "deep_research_report",
+                "content": report_text,
+            }
+            if dr_ts:
+                report_msg["timestamp"] = dr_ts
+            msgs.append(report_msg)
+    elif has_dr_card:
+        incomplete = "deep_research_report_not_captured"
+
+    cand_titles = [
+        _clean_gemini_title(str(extracted.get("pageTitle") or "")),
+        _clean_gemini_title(str(extracted.get("titleElText") or "")),
+        _clean_gemini_title(title_hint),
+    ]
+    final_title = next((t for t in cand_titles if t), "")
+    if not final_title and msgs:
+        final_title = _strip_directional_chars(str(msgs[0].get("content") or "")).splitlines()[0][
+            :80
+        ]
+
+    return {
+        "title": final_title or "Google Gemini Chat",
+        "messages": msgs,
+        "incomplete": incomplete,
+        "created_at": dr_ts,
+    }
+
+
 async def _sync_gemini_app_page(
     page: Any,
     max_chats: int,
     base_dir: Path | str | None,
+    extra_chats: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    await page.goto("https://gemini.google.com/search", wait_until="domcontentloaded")
-    await asyncio.sleep(4.0)
-
-    await page.evaluate(
-        """() => {
-            const isOpen = !!document.querySelector(
-                'bard-sidenav.sidenav-open, button[aria-label*="Close sidebar" i], ' +
-                'conversations-list a[href*="/app/"]'
-            );
-            if (!isOpen) {
-                const menuBtn = document.querySelector(
-                    'button[aria-label*="Open" i], button[aria-label*="Main menu" i], ' +
-                    'button[data-test-id="side-nav-menu-button"]'
-                );
-                if (menuBtn) menuBtn.click();
-            }
-        }"""
-    )
-    await asyncio.sleep(2.0)
-
+    _log_progress(f"Starting Gemini sync (max_chats={max_chats})...")
     collected_chats: list[dict[str, str]] = []
     seen_ids: set[str] = set()
 
-    for attempt in range(25):
-        items = await page.evaluate(
+    if extra_chats is None:
+        await page.goto("https://gemini.google.com/search", wait_until="domcontentloaded")
+        await asyncio.sleep(4.0)
+
+        await page.evaluate(
             """() => {
-                const out = [];
-                document.querySelectorAll('a[href*="/app/"]').forEach(a => {
-                    const href = a.getAttribute('href') || '';
-                    if (/accounts\\.google\\.com|SignOutOptions/i.test(href)) return;
-                    const m = href.match(/\\/app\\/([a-zA-Z0-9_-]{8,})/);
-                    if (m) {
-                        out.push({
-                            id: m[1],
-                            url: new URL(href, location.origin).href,
-                            title: (a.innerText || a.getAttribute('aria-label') || '').trim()
-                        });
-                    }
-                });
-                const convSelector =
-                    '[data-test-id="conversation"], ' +
-                    '.conversation-items-container [role="button"], ' +
-                    'conversations-list [role="listitem"]';
-                document.querySelectorAll(convSelector).forEach(el => {
-                    const text = (el.innerText || '').trim().split('\\n')[0];
-                    const jslog = el.getAttribute('jslog') || '';
-                    const idMatch =
-                        jslog.match(/c_([a-zA-Z0-9_-]{8,})/) ||
-                        jslog.match(/([a-f0-9]{16})/);
-                    if (idMatch && text) {
-                        out.push({
-                            id: idMatch[1],
-                            url: `https://gemini.google.com/app/${idMatch[1]}`,
-                            title: text
-                        });
-                    }
-                });
-                return out;
+                const sidenav = document.querySelector('bard-sidenav');
+                const isCollapsed = !!(sidenav && sidenav.className.includes('collapsed'));
+                const isOpen = !isCollapsed && !!document.querySelector(
+                    'bard-sidenav.sidenav-open, button[aria-label*="Close sidebar" i], ' +
+                    'conversations-list a[href*="/app/"]'
+                );
+                if (!isOpen || isCollapsed) {
+                    const menuBtn = document.querySelector(
+                        'button[data-test-id="side-nav-sparkle-button"], ' +
+                        'button[aria-label*="Open sidebar" i], ' +
+                        'button[data-test-id="side-nav-menu-button"], ' +
+                        'button[aria-label*="Main menu" i], ' +
+                        'button[aria-label*="Open" i]'
+                    );
+                    if (menuBtn) menuBtn.click();
+                }
             }"""
         )
-        new_found = 0
-        for item in items:
+        await asyncio.sleep(2.0)
+
+        stale_scroll_rounds = 0
+        for attempt in range(50):
+            items = await page.evaluate(
+                """() => {
+                    const out = [];
+                    document.querySelectorAll('a[href*="/app/"]').forEach(a => {
+                        const href = a.getAttribute('href') || '';
+                        if (/accounts\\.google\\.com|SignOutOptions/i.test(href)) return;
+                        const m = href.match(/\\/app\\/([a-zA-Z0-9_-]{8,})/);
+                        if (m) {
+                            out.push({
+                                id: m[1],
+                                url: new URL(href, location.origin).href,
+                                title: (a.innerText || a.getAttribute('aria-label') || '').trim()
+                            });
+                        }
+                    });
+                    const convSelector =
+                        '[data-test-id="conversation"], ' +
+                        '.conversation-items-container [role="button"], ' +
+                        'conversations-list [role="listitem"]';
+                    document.querySelectorAll(convSelector).forEach(el => {
+                        const text = (el.innerText || '').trim().split('\\n')[0];
+                        const jslog = el.getAttribute('jslog') || '';
+                        const idMatch =
+                            jslog.match(/c_([a-zA-Z0-9_-]{8,})/) ||
+                            jslog.match(/([a-f0-9]{16})/);
+                        if (idMatch && text) {
+                            out.push({
+                                id: idMatch[1],
+                                url: `https://gemini.google.com/app/${idMatch[1]}`,
+                                title: text
+                            });
+                        }
+                    });
+                    return out;
+                }"""
+            )
+            new_found = 0
+            for item in items:
+                cid = item["id"]
+                if cid not in seen_ids:
+                    seen_ids.add(cid)
+                    collected_chats.append(item)
+                    new_found += 1
+
+            if len(collected_chats) >= max_chats:
+                break
+
+            scrolled = await page.evaluate(
+                """() => {
+                    const moreBtn = Array.from(
+                        document.querySelectorAll('conversations-list button, bard-sidenav button')
+                    ).find(el => /show more|load more/i.test((el.innerText || '').trim()));
+                    if (moreBtn) {
+                        moreBtn.click();
+                        return true;
+                    }
+                    const scrollers = document.querySelectorAll(
+                        'bard-sidenav infinite-scroller, ' +
+                        'side-navigation-content infinite-scroller, ' +
+                        'conversations-list, infinite-scroller:not(.chat-history), ' +
+                        'nav, [role="navigation"]'
+                    );
+                    let didScroll = false;
+                    scrollers.forEach(s => {
+                        if (
+                            s.scrollHeight > s.clientHeight &&
+                            s.scrollTop + s.clientHeight < s.scrollHeight - 5
+                        ) {
+                            s.scrollTop = s.scrollHeight;
+                            didScroll = true;
+                        }
+                    });
+                    return didScroll;
+                }"""
+            )
+            await asyncio.sleep(1.5)
+            if not scrolled and new_found == 0:
+                stale_scroll_rounds += 1
+                if (len(collected_chats) > 0 and stale_scroll_rounds >= 2) or attempt >= 4:
+                    break
+            else:
+                stale_scroll_rounds = 0
+    else:
+        for item in extra_chats:
             cid = item["id"]
             if cid not in seen_ids:
                 seen_ids.add(cid)
                 collected_chats.append(item)
-                new_found += 1
 
-        if len(collected_chats) >= max_chats:
-            break
-
-        scrolled = await page.evaluate(
-            """() => {
-                const moreBtn = Array.from(document.querySelectorAll('button, span')).find(
-                    el => /show more|load more/i.test((el.innerText || '').trim())
-                );
-                if (moreBtn) {
-                    moreBtn.click();
-                    return true;
-                }
-                const scrollers = document.querySelectorAll(
-                    'conversations-list, infinite-scroller, nav, [role="navigation"]'
-                );
-                let didScroll = false;
-                scrollers.forEach(s => {
-                    if (
-                        s.scrollHeight > s.clientHeight &&
-                        s.scrollTop + s.clientHeight < s.scrollHeight - 5
-                    ) {
-                        s.scrollTop = s.scrollHeight;
-                        didScroll = true;
-                    }
-                });
-                return didScroll;
-            }"""
-        )
-        await asyncio.sleep(1.5)
-        if not scrolled and new_found == 0 and (len(collected_chats) > 0 or attempt >= 4):
-            break
-
+    _log_progress(f"[gemini] Found {len(collected_chats)} chat(s); syncing up to {max_chats}...")
     synced_results: list[dict[str, Any]] = []
-    for chat_meta in collected_chats[:max_chats]:
+    targets = collected_chats[:max_chats]
+    for idx, chat_meta in enumerate(targets, start=1):
         cid = chat_meta["id"]
         url = chat_meta["url"]
-        title_hint = chat_meta["title"] or f"Gemini Chat {cid}"
+        title_hint = chat_meta.get("title") or f"Gemini Chat {cid}"
+        _log_progress(f"[gemini] ({idx}/{len(targets)}) {cid}")
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(4.0)
-            harvested = await _harvest_gemini_turns_from_page(page)
-
-            extracted = (
-                await page.evaluate(
-                    """() => {
-                    const messages = [];
-                    const turnNodes = document.querySelectorAll(
-                        'user-query, model-response, ' +
-                        '[data-message-author-role], .conversation-container'
-                    );
-                    if (turnNodes.length > 0) {
-                        turnNodes.forEach(node => {
-                            const tag = node.tagName.toLowerCase();
-                            const roleAttr = node.getAttribute('data-message-author-role');
-                            if (tag === 'user-query' || roleAttr === 'user') {
-                                const qEl = node.querySelector(
-                                    '.query-text, .user-query-text'
-                                ) || node;
-                                const txt = (qEl.innerText || '')
-                                    .replace(/^You said[^\\n]*\\n+/i, '')
-                                    .replace(/^You said\\s*/i, '')
-                                    .trim();
-                                if (txt) messages.push({ role: 'user', content: txt });
-                            } else if (tag === 'model-response' || roleAttr === 'model') {
-                                const md = node.querySelector(
-                                    'message-content, .markdown, .model-response-text'
-                                ) || node;
-                                const txt = (md.innerText || '')
-                                    .replace(/^Gemini said\\s*/i, '')
-                                    .trim();
-                                if (txt) messages.push({ role: 'assistant', content: txt });
-                            }
-                        });
-                    }
-                    const titleEl = document.querySelector(
-                        '[data-test-id="conversation-title"], .conversation-title'
-                    );
-                    let pageTitle = (titleEl?.innerText || document.title || '')
-                        .replace(/^Gemini\\s*[-–—]\\s*/i, '')
-                        .trim();
-                    if (/^(Google Gemini|Conversation with Gemini|Gemini)$/i.test(pageTitle)) {
-                        pageTitle = '';
-                    }
-                    return { pageTitle, messages };
-                }"""
-                )
-                or {}
-            )
-            msgs = harvested if harvested else (extracted.get("messages") or [])
-            final_title = _strip_directional_chars(extracted.get("pageTitle") or title_hint)
-            if msgs:
+            parsed = await _extract_gemini_chat_from_page(page, title_hint=title_hint)
+            if parsed["messages"]:
                 saved = upsert_chat(
                     chat_id=cid,
-                    title=final_title,
-                    messages=msgs,
+                    title=parsed["title"],
+                    messages=parsed["messages"],
                     source="browser_gemini",
                     url=url,
+                    created_at=parsed.get("created_at"),
                     base_dir=base_dir,
+                    incomplete=parsed.get("incomplete"),
                 )
                 synced_results.append(saved)
         except Exception as exc:
             synced_results.append({"chat_id": cid, "error": str(exc)})
+    _log_progress(
+        f"[gemini] Completed: {len([r for r in synced_results if 'markdown_path' in r])} synced."
+    )
     return synced_results
 
 
@@ -717,6 +1049,7 @@ async def _sync_search_ai_mode_page(
     base_dir: Path | str | None,
 ) -> list[dict[str, Any]]:
     """Scrapes Google Search AI Mode (google.com/search?udm=50 / AI Mode history sidebar)."""
+    _log_progress(f"Starting Search AI Mode sync (max_chats={max_chats})...")
     await page.goto("https://www.google.com/search?udm=50", wait_until="domcontentloaded")
     await asyncio.sleep(3.0)
 
@@ -771,12 +1104,18 @@ async def _sync_search_ai_mode_page(
     seen_urls: set[str] = set()
     unique_threads = []
     for t in threads:
-        if t["url"] not in seen_urls:
-            seen_urls.add(t["url"])
+        canon = _canonicalize_aimode_url(
+            t["url"], thread_id=t.get("threadId"), query=t.get("title")
+        )
+        if canon not in seen_urls:
+            seen_urls.add(canon)
             unique_threads.append(t)
 
+    _log_progress(f"[aimode] Found {len(unique_threads)} thread(s); syncing up to {max_chats}...")
     synced: list[dict[str, Any]] = []
-    for t in unique_threads[:max_chats]:
+    targets = unique_threads[:max_chats]
+    for idx, t in enumerate(targets, start=1):
+        _log_progress(f"[aimode] ({idx}/{len(targets)}) {t.get('title', '')[:40]}")
         try:
             tid = t.get("threadId")
             if tid:
@@ -827,8 +1166,17 @@ async def _sync_search_ai_mode_page(
                 }"""
             )
             if turns:
-                real_url = page.url if tid and "udm=50" in page.url else t["url"]
-                cid = f"aimode_{tid or hashlib.sha1(t['url'].encode()).hexdigest()[:14]}"
+                raw_url = page.url if tid and "udm=50" in page.url else t["url"]
+                first_user_q = next(
+                    (m["content"] for m in turns if m.get("role") == "user" and m.get("content")),
+                    None,
+                )
+                canonical_url = _canonicalize_aimode_url(
+                    raw_url,
+                    thread_id=tid,
+                    query=first_user_q or t.get("title"),
+                )
+                cid = f"aimode_{tid or hashlib.sha1(canonical_url.encode()).hexdigest()[:14]}"
                 final_messages = (
                     turns
                     if (turns and turns[0].get("role") == "user")
@@ -840,13 +1188,278 @@ async def _sync_search_ai_mode_page(
                         title=t["title"][:80],
                         messages=final_messages,
                         source="browser_search_ai_mode",
-                        url=real_url,
+                        url=canonical_url,
                         base_dir=base_dir,
                     )
                 )
         except Exception as exc:
             synced.append({"url": t["url"], "error": str(exc)})
+    _log_progress(f"[aimode] Completed: {len([r for r in synced if 'markdown_path' in r])} synced.")
     return synced
+
+
+_AISTUDIO_HARVEST_JS = """() => {
+    const out = [];
+    const attachments = [];
+
+    const stripIcons = (root) => {
+        const clone = root.cloneNode(true);
+        clone.querySelectorAll(
+            '.actions-container, .author-label, mat-icon, ' +
+            '.material-symbols-outlined, .material-symbols-rounded, .material-symbols-filled, ' +
+            '.material-icons, [aria-hidden="true"], button, ms-chat-turn-options'
+        ).forEach(el => el.remove());
+        return clone;
+    };
+
+    const parseFileChunk = (fc) => {
+        const nameEl = fc.querySelector('.name, [title]');
+        const name = (nameEl?.getAttribute('title') || nameEl?.innerText || fc.innerText || '')
+            .trim()
+            .split('\\n')[0]
+            .trim();
+        const tokensEl = fc.querySelector('.token-count');
+        const tokens = (tokensEl?.innerText || '').trim();
+        let driveId = fc.getAttribute('data-drive-id') ||
+            fc.querySelector('[data-drive-id]')?.getAttribute('data-drive-id') || '';
+        let url = '';
+        const linkEl = fc.querySelector('a[href*="drive.google"], a[href*="docs.google"], a[href]');
+        if (linkEl) {
+            url = linkEl.getAttribute('href') || '';
+        } else {
+            const img = fc.querySelector('img[src]');
+            if (img) url = img.getAttribute('src') || '';
+        }
+        if (!driveId && url) {
+            const m = url.match(/\\/d\\/([a-zA-Z0-9_-]{10,})/) ||
+                url.match(/[?&]id=([a-zA-Z0-9_-]{10,})/);
+            if (m) driveId = m[1];
+        }
+        if (driveId && (!url || url.includes('drive-storage'))) {
+            url = `https://drive.google.com/file/d/${driveId}/view`;
+        }
+        if (name || driveId) {
+            return {
+                name: name || driveId || 'Drive Attachment',
+                tokens: tokens || null,
+                drive_id: driveId || null,
+                url: url || null,
+            };
+        }
+        return null;
+    };
+
+    const msTurns = Array.from(document.querySelectorAll('ms-chat-turn'));
+    if (msTurns.length > 0) {
+        msTurns.forEach((turn, idx) => {
+            const turnId = turn.id || `idx_${idx}`;
+            const roleNode = turn.querySelector('[data-turn-role]');
+            const container = turn.querySelector('.chat-turn-container');
+            const roleRaw = (
+                roleNode?.getAttribute('data-turn-role') ||
+                container?.className ||
+                turn.className ||
+                ''
+            ).toLowerCase();
+            const role = roleRaw.includes('user') ? 'user' : 'assistant';
+
+            const contentRoot = turn.querySelector('.turn-content') || roleNode || turn;
+            const turnAttachments = [];
+            contentRoot.querySelectorAll('ms-file-chunk').forEach(fc => {
+                const att = parseFileChunk(fc);
+                if (att) {
+                    turnAttachments.push(att);
+                    attachments.push(att);
+                }
+            });
+
+            // Thoughts
+            let thoughtText = '';
+            const thoughtChunk = contentRoot.querySelector('ms-thought-chunk');
+            if (thoughtChunk) {
+                const body = thoughtChunk.querySelector('.mat-expansion-panel-body, ms-text-chunk');
+                if (body) {
+                    const cleanBody = stripIcons(body);
+                    thoughtText = (cleanBody.innerText || cleanBody.textContent || '').trim();
+                }
+            }
+
+            // Regular body (without thoughts or file chunks or icons)
+            const bodyClone = stripIcons(contentRoot);
+            bodyClone.querySelectorAll(
+                'ms-thought-chunk, ms-file-chunk'
+            ).forEach(el => el.remove());
+            const bodyText = (bodyClone.innerText || bodyClone.textContent || '').trim();
+
+            out.push({
+                id: turnId,
+                role,
+                text: bodyText,
+                thought: thoughtText,
+                attachments: turnAttachments,
+            });
+        });
+    } else {
+        // Legacy/fallback selector for non-ms-chat-turn DOMs
+        document.querySelectorAll('.chat-turn, [data-turn-role]').forEach((el, idx) => {
+            if (el.closest('ms-chat-turn')) return;
+            const roleRaw = (
+                el.getAttribute('data-turn-role') || el.className || ''
+            ).toLowerCase();
+            const role = roleRaw.includes('user') ? 'user' : 'assistant';
+            const clean = stripIcons(el);
+            const txt = (clean.innerText || clean.textContent || '').trim();
+            if (txt) {
+                out.push({ id: `legacy_${idx}`, role, text: txt, thought: '', attachments: [] });
+            }
+        });
+    }
+
+    const titleEl = document.querySelector('h1.mode-title, .page-title h1, h1');
+    let pageTitle = '';
+    if (titleEl) {
+        const cleanTitle = stripIcons(titleEl);
+        pageTitle = (cleanTitle.innerText || cleanTitle.textContent || '').trim();
+    }
+    if (!pageTitle) {
+        pageTitle = (document.title || '').replace(/\\s*\\|\\s*Google AI Studio$/i, '').trim();
+    }
+    return { pageTitle, turns: out, attachments };
+}"""
+
+
+async def _extract_aistudio_from_page(
+    page: Any,
+    title_hint: str = "",
+) -> dict[str, Any]:
+    """Harvests virtualized AI Studio turns, thoughts, and Drive attachments cleanly."""
+    collected_by_id: dict[str, dict[str, Any]] = {}
+    ordered_ids: list[str] = []
+    attachments_map: dict[tuple[str, str], dict[str, Any]] = {}
+    extracted_title = ""
+
+    def _absorb(res: Any) -> None:
+        nonlocal extracted_title
+        if isinstance(res, list):
+            # Support simplified mock tests returning a list of {role, content}
+            for idx, item in enumerate(res):
+                if not isinstance(item, dict):
+                    continue
+                tid = f"mock_{idx}"
+                if tid not in collected_by_id:
+                    ordered_ids.append(tid)
+                collected_by_id[tid] = {
+                    "role": item.get("role", "user"),
+                    "text": str(item.get("content") or "").strip(),
+                    "thought": "",
+                    "attachments": [],
+                }
+            return
+        if not isinstance(res, dict):
+            return
+        if res.get("pageTitle") and not extracted_title:
+            extracted_title = _strip_directional_chars(str(res["pageTitle"]))
+        for att in res.get("attachments") or []:
+            if isinstance(att, dict):
+                key = (str(att.get("name") or ""), str(att.get("drive_id") or ""))
+                attachments_map[key] = att
+        for t in res.get("turns") or []:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("id") or f"turn_{len(ordered_ids)}")
+            prev = collected_by_id.get(tid)
+            if tid not in collected_by_id:
+                ordered_ids.append(tid)
+            # Keep whichever version actually rendered non-empty content/attachments
+            has_new_data = bool(
+                (t.get("text") or "").strip()
+                or (t.get("thought") or "").strip()
+                or (t.get("attachments") or [])
+            )
+            if prev is None or has_new_data:
+                if prev is not None and not has_new_data:
+                    continue
+                collected_by_id[tid] = t
+
+    try:
+        # Scroll to top so early turns (such as Turn 0 Drive attachments) mount
+        await page.evaluate(
+            """() => {
+                document.querySelectorAll(
+                    'ms-thought-chunk mat-expansion-panel-header[aria-expanded="false"]'
+                ).forEach(hdr => hdr.click());
+                const sc = document.querySelector('ms-autoscroll-container');
+                if (sc) sc.scrollTop = 0;
+            }"""
+        )
+        await asyncio.sleep(0.6)
+        _absorb(await page.evaluate(_AISTUDIO_HARVEST_JS))
+
+        # Walk downward if ms-autoscroll-container is tall/virtualized
+        prev_top = -1
+        for _ in range(40):
+            scroll_info = await page.evaluate(
+                """() => {
+                    const sc = document.querySelector('ms-autoscroll-container');
+                    if (!sc || sc.scrollHeight <= sc.clientHeight + 20) {
+                        return { top: 0, height: 0, client: 0 };
+                    }
+                    sc.scrollTop = sc.scrollTop + Math.max(300, sc.clientHeight * 0.75);
+                    document.querySelectorAll(
+                        'ms-thought-chunk mat-expansion-panel-header[aria-expanded="false"]'
+                    ).forEach(hdr => hdr.click());
+                    return { top: sc.scrollTop, height: sc.scrollHeight, client: sc.clientHeight };
+                }"""
+            )
+            if not isinstance(scroll_info, dict) or scroll_info.get("height", 0) == 0:
+                break
+            await asyncio.sleep(0.4)
+            _absorb(await page.evaluate(_AISTUDIO_HARVEST_JS))
+            at_bottom = (
+                scroll_info.get("top", 0) + scroll_info.get("client", 0)
+                >= scroll_info.get("height", 1) - 5
+            )
+            if at_bottom or scroll_info.get("top") == prev_top:
+                break
+            prev_top = scroll_info.get("top", -1)
+    except Exception:
+        pass
+
+    messages: list[dict[str, Any]] = []
+    for tid in ordered_ids:
+        t = collected_by_id[tid]
+        role = str(t.get("role") or "user")
+        thought = _strip_directional_chars(str(t.get("thought") or ""))
+        text = _strip_directional_chars(str(t.get("text") or ""))
+        turn_atts = t.get("attachments") or []
+
+        if thought and not re.fullmatch(
+            r"(?:Thoughts\s*)?Expand to view model thoughts", thought, re.I
+        ):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "kind": "thought",
+                    "content": f"*(Thinking)*\n{thought}",
+                }
+            )
+        if text:
+            messages.append({"role": role, "content": text})
+        elif turn_atts:
+            att_lines = []
+            for att in turn_atts:
+                label = str(att.get("name") or "Attachment")
+                tok = att.get("tokens")
+                did = att.get("drive_id")
+                extra = ", ".join(p for p in (tok, f"Drive ID: {did}" if did else "") if p)
+                att_lines.append(f"[Attachment: {label}" + (f" ({extra})]" if extra else "]"))
+            messages.append({"role": role, "kind": "attachment", "content": "\n".join(att_lines)})
+
+    return {
+        "title": extracted_title or _strip_directional_chars(title_hint) or "Google AI Studio",
+        "messages": messages,
+        "attachments": list(attachments_map.values()),
+    }
 
 
 async def _sync_aistudio_page(
@@ -855,6 +1468,7 @@ async def _sync_aistudio_page(
     base_dir: Path | str | None,
 ) -> list[dict[str, Any]]:
     """Scrapes Google AI Studio saved prompts library (aistudio.google.com/library)."""
+    _log_progress(f"Starting AI Studio sync (max_chats={max_chats})...")
     await page.goto("https://aistudio.google.com/library", wait_until="domcontentloaded")
     await asyncio.sleep(3.0)
 
@@ -865,8 +1479,21 @@ async def _sync_aistudio_page(
                 const href = a.href || '';
                 const m = href.match(/\\/prompts\\/([a-zA-Z0-9_-]{8,})/);
                 const title = (a.innerText || '').trim().split('\\n')[0];
+                const row = a.closest('tr, [role="row"]');
+                let updatedText = '';
+                if (row) {
+                    const cells = Array.from(row.querySelectorAll('td, [role="cell"]'));
+                    if (cells.length >= 2) {
+                        updatedText = (cells[1].innerText || '').trim();
+                    }
+                }
                 if (m && !href.endsWith('/new_chat')) {
-                    out.push({ id: m[1], url: href, title: title || `AI Studio ${m[1]}` });
+                    out.push({
+                        id: m[1],
+                        url: href,
+                        title: title || `AI Studio ${m[1]}`,
+                        updatedText,
+                    });
                 }
             });
             return out;
@@ -880,40 +1507,35 @@ async def _sync_aistudio_page(
             seen_ids.add(item["id"])
             unique_links.append(item)
 
+    _log_progress(f"[aistudio] Found {len(unique_links)} prompt(s); syncing up to {max_chats}...")
     synced: list[dict[str, Any]] = []
-    for item in unique_links[:max_chats]:
+    targets = unique_links[:max_chats]
+    for idx, item in enumerate(targets, start=1):
+        _log_progress(f"[aistudio] ({idx}/{len(targets)}) {item['id']}")
         try:
             await page.goto(item["url"], wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(3.0)
-            turns = await page.evaluate(
-                """() => {
-                    const messages = [];
-                    document.querySelectorAll(
-                        'ms-chat-turn, .chat-turn, [data-turn-role]'
-                    ).forEach(el => {
-                        const roleAttr = (
-                            el.getAttribute('data-turn-role') || el.className || ''
-                        ).toLowerCase();
-                        const role = roleAttr.includes('user') ? 'user' : 'assistant';
-                        const txt = (el.innerText || '').trim();
-                        if (txt) messages.push({ role, content: txt });
-                    });
-                    return messages;
-                }"""
-            )
-            if turns:
+            parsed = await _extract_aistudio_from_page(page, title_hint=item["title"])
+            parsed_ts = _parse_surface_timestamp(item.get("updatedText"))
+            if parsed["messages"]:
                 synced.append(
                     upsert_chat(
                         chat_id=f"aistudio_{item['id']}",
-                        title=item["title"][:80],
-                        messages=turns,
+                        title=parsed["title"][:80],
+                        messages=parsed["messages"],
                         source="browser_aistudio",
                         url=item["url"],
+                        created_at=parsed_ts,
+                        updated_at=parsed_ts,
                         base_dir=base_dir,
+                        attachments=parsed.get("attachments") or None,
                     )
                 )
         except Exception as exc:
             synced.append({"chat_id": item["id"], "error": str(exc)})
+    _log_progress(
+        f"[aistudio] Completed: {len([r for r in synced if 'markdown_path' in r])} synced."
+    )
     return synced
 
 
@@ -923,6 +1545,7 @@ async def _sync_notebooklm_page(
     base_dir: Path | str | None,
 ) -> list[dict[str, Any]]:
     """Scrapes NotebookLM notebooks and chat notes (notebooklm.google.com)."""
+    _log_progress(f"Starting NotebookLM sync (max_chats={max_chats})...")
     await page.goto("https://notebooklm.google.com/", wait_until="domcontentloaded")
     await asyncio.sleep(3.0)
 
@@ -948,8 +1571,11 @@ async def _sync_notebooklm_page(
             seen_ids.add(nb["id"])
             unique_nbs.append(nb)
 
+    _log_progress(f"[notebooklm] Found {len(unique_nbs)} notebook(s); syncing up to {max_chats}...")
     synced: list[dict[str, Any]] = []
-    for nb in unique_nbs[:max_chats]:
+    targets = unique_nbs[:max_chats]
+    for idx, nb in enumerate(targets, start=1):
+        _log_progress(f"[notebooklm] ({idx}/{len(targets)}) {nb['id']}")
         try:
             await page.goto(nb["url"], wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(3.0)
@@ -972,7 +1598,92 @@ async def _sync_notebooklm_page(
                 )
         except Exception as exc:
             synced.append({"chat_id": nb["id"], "error": str(exc)})
+    _log_progress(
+        f"[notebooklm] Completed: {len([r for r in synced if 'markdown_path' in r])} synced."
+    )
     return synced
+
+
+def _parse_myactivity_dialog_text(
+    dialog_text: str,
+    links: list[str],
+    fallback_prompt: str,
+) -> dict[str, Any]:
+    """Parses prompt, assistant response, timestamp string, and source_chat_id from a dialog."""
+    lines = [_strip_directional_chars(ln) for ln in dialog_text.splitlines()]
+    lines = [ln for ln in lines if ln]
+
+    skip_headers = {
+        "Item details",
+        "more_vert",
+        "close",
+        "Gemini Apps",
+        "Search",
+        "AI Mode",
+        "Details",
+        "event",
+        "apps",
+        "chat",
+        "search",
+    }
+    footer_markers = ("Why this activity?", "If you use a shared device")
+
+    prompt_text = ""
+    time_text = ""
+    body_lines: list[str] = []
+    seen_details = False
+    for ln in lines:
+        if any(ln.startswith(m) for m in footer_markers):
+            break
+        if ln in skip_headers:
+            if ln == "Details":
+                seen_details = True
+            continue
+        if not seen_details and re.match(
+            r"^(Prompted|Asked in AI Mode|Asked|Searched for)\b", ln, re.IGNORECASE
+        ):
+            prompt_text = re.sub(
+                r"^(Prompted|Asked in AI Mode|Asked|Searched for)\s*:?\s*",
+                "",
+                ln,
+                flags=re.IGNORECASE,
+            ).strip()
+            continue
+        if re.match(
+            r"^(?:Today|Yesterday|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2})"
+            r"(?:,?\s*\d{4})?(?:\s+at)?\s+\d{1,2}:\d{2}\s*(?:AM|PM)?$",
+            ln,
+            flags=re.IGNORECASE,
+        ):
+            time_text = ln
+            continue
+        if ln.startswith("https://gemini.google.com/") or ln.startswith("https://www.google.com/"):
+            continue
+        if seen_details:
+            body_lines.append(ln)
+
+    source_chat_id: str | None = None
+    source_url: str | None = None
+    for href in links:
+        m_gem = re.search(r"gemini\.google\.com/(?:u/\d+/)?app/([a-zA-Z0-9_-]{8,})", href)
+        if m_gem:
+            source_chat_id = m_gem.group(1)
+            source_url = f"https://gemini.google.com/app/{source_chat_id}"
+            break
+        if "udm=50" in href:
+            source_url = _canonicalize_aimode_url(href)
+            m_mtid = re.search(r"mtid=([a-zA-Z0-9_-]+)", source_url)
+            if m_mtid:
+                source_chat_id = f"aimode_{m_mtid.group(1)}"
+            break
+
+    return {
+        "prompt": prompt_text or fallback_prompt,
+        "response": "\n".join(body_lines).strip(),
+        "time_text": time_text,
+        "source_chat_id": source_chat_id,
+        "source_url": source_url,
+    }
 
 
 async def _sync_myactivity_page(
@@ -981,12 +1692,14 @@ async def _sync_myactivity_page(
     base_dir: Path | str | None,
 ) -> list[dict[str, Any]]:
     """Scrapes Google's central My Activity hub (myactivity.google.com/product/gemini & search)."""
+    _log_progress(f"Starting My Activity sync (max_chats={max_chats})...")
     urls = [
         ("https://myactivity.google.com/product/gemini", "myactivity_gemini"),
         ("https://myactivity.google.com/product/search", "myactivity_search_ai"),
     ]
     synced: list[dict[str, Any]] = []
     for url, src_tag in urls:
+        _log_progress(f"[myactivity] Scanning {src_tag} ({url})...")
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(2.5)
@@ -994,10 +1707,11 @@ async def _sync_myactivity_page(
                 r"""(maxItems) => {
                     const out = [];
                     const els = document.querySelectorAll(
-                        'c-wiz [role="listitem"], [data-date] [ role="region" ], article'
+                        'c-wiz [role="listitem"], [data-date] [role="region"], article'
                     );
                     const badges = /^(Gemini Apps|AI Mode|Search|Google Search|YouTube|Maps)$/i;
-                    els.forEach(el => {
+                    const metaRe = /^\d{1,2}:\d{2}\s*(?:AM|PM)?\s*(?:•.*)?(?:Details)?$/i;
+                    els.forEach((el, idx) => {
                         if (out.length >= maxItems) return;
                         const txt = (el.innerText || '').trim();
                         if (!txt || /Cleared previous feedback/i.test(txt)) return;
@@ -1006,12 +1720,31 @@ async def _sync_myactivity_page(
                             while (lines.length > 1 && badges.test(lines[0])) {
                                 lines.shift();
                             }
-                            const bodyLines = lines.slice(1).filter(
-                                l => !/^\d{1,2}:\d{2}\s*(AM|PM)?\s*•\s*Details$/i.test(l)
+                            let timeStr = '';
+                            const bodyLines = [];
+                            for (const l of lines.slice(1)) {
+                                if (metaRe.test(l) || /^Details$/i.test(l)) {
+                                    const tm = l.match(/\d{1,2}:\d{2}\s*(?:AM|PM)?/i);
+                                    if (tm && !timeStr) timeStr = tm[0];
+                                    continue;
+                                }
+                                bodyLines.push(l);
+                            }
+                            const dateHolder = el.closest('[data-date]');
+                            const dataDate = dateHolder?.getAttribute('data-date') || '';
+                            const markerAttr = `data-gah-idx="${idx}"`;
+                            el.setAttribute('data-gah-idx', String(idx));
+                            const hasDetailsBtn = !!el.querySelector(
+                                'a.WFTFcf, a[aria-label*="details" i], ' +
+                                'button[aria-label*="details" i]'
                             );
                             out.push({
+                                idx,
                                 title: lines[0] || 'My Activity AI Entry',
-                                body: bodyLines.join('\n')
+                                body: bodyLines.join('\n'),
+                                dataDate,
+                                timeStr,
+                                hasDetailsBtn,
                             });
                         }
                     });
@@ -1019,31 +1752,126 @@ async def _sync_myactivity_page(
                 }""",
                 max_chats,
             )
-            for card in cards[:max_chats]:
+
+            _log_progress(f"[myactivity:{src_tag}] Found {len(cards)} entry card(s).")
+            for card_num, card in enumerate(cards[:max_chats], start=1):
                 title_clean = re.sub(
                     r"^(Prompted|Asked in AI Mode|Asked|Searched for)\s*:?\s*",
                     "",
                     card["title"],
                     flags=re.IGNORECASE,
                 ).strip()
-                cid_hash = hashlib.sha1(
-                    f"{src_tag}:{title_clean}:{card['body'][:80]}".encode()
-                ).hexdigest()[:14]
+                prompt_full = title_clean or card["title"]
+                response_full = str(card.get("body") or "").strip()
+                time_raw = str(card.get("timeStr") or "")
+                data_date = str(card.get("dataDate") or "")
+                source_chat_id: str | None = None
+                entry_url = url
+
+                if card.get("hasDetailsBtn") and card.get("idx") is not None:
+                    try:
+                        clicked = await page.evaluate(
+                            """(idx) => {
+                                const el = document.querySelector(`[data-gah-idx="${idx}"]`);
+                                if (!el) return false;
+                                const btn = el.querySelector(
+                                    'a.WFTFcf, a[aria-label*="details" i], ' +
+                                    'button[aria-label*="details" i]'
+                                );
+                                if (!btn) return false;
+                                btn.click();
+                                return true;
+                            }""",
+                            card["idx"],
+                        )
+                        if clicked:
+                            dialog_data = None
+                            for _ in range(10):
+                                await asyncio.sleep(0.25)
+                                dialog_data = await page.evaluate(
+                                    """() => {
+                                        const d = document.querySelector(
+                                            '[role="dialog"], [aria-modal="true"]'
+                                        );
+                                        if (!d) return null;
+                                        const linkList = Array.from(
+                                            d.querySelectorAll('a[href]')
+                                        ).map(a => a.href);
+                                        return {
+                                            text: (d.innerText || '').trim(),
+                                            links: linkList,
+                                        };
+                                    }"""
+                                )
+                                if isinstance(dialog_data, dict) and dialog_data.get("text"):
+                                    break
+                            if isinstance(dialog_data, dict) and dialog_data.get("text"):
+                                parsed_dlg = _parse_myactivity_dialog_text(
+                                    dialog_data["text"],
+                                    dialog_data.get("links") or [],
+                                    fallback_prompt=prompt_full,
+                                )
+                                prompt_full = parsed_dlg["prompt"] or prompt_full
+                                if parsed_dlg["response"]:
+                                    response_full = parsed_dlg["response"]
+                                if parsed_dlg["time_text"]:
+                                    time_raw = parsed_dlg["time_text"]
+                                source_chat_id = parsed_dlg.get("source_chat_id")
+                                if parsed_dlg.get("source_url"):
+                                    entry_url = parsed_dlg["source_url"]
+                            await page.evaluate(
+                                """() => {
+                                    const closeBtn = document.querySelector(
+                                        '[role="dialog"] button[aria-label*="close" i], ' +
+                                        '[role="dialog"] button[aria-label*="dismiss" i]'
+                                    );
+                                    if (closeBtn) closeBtn.click();
+                                }"""
+                            )
+                            await asyncio.sleep(0.15)
+                    except Exception:
+                        pass
+
+                iso_ts = _parse_surface_timestamp(time_raw, data_date=data_date)
+                msgs: list[dict[str, Any]] = [
+                    {
+                        "role": "user",
+                        "content": prompt_full,
+                        **({"timestamp": iso_ts} if iso_ts else {}),
+                    }
+                ]
+                if response_full:
+                    msgs.append(
+                        {
+                            "role": "assistant",
+                            "content": response_full,
+                            **({"timestamp": iso_ts} if iso_ts else {}),
+                        }
+                    )
+
+                hash_seed = (
+                    f"{src_tag}:{source_chat_id or ''}:{iso_ts or card_num}:"
+                    f"{prompt_full}:{response_full[:80]}"
+                )
+                cid_hash = hashlib.sha1(hash_seed.encode()).hexdigest()[:14]
                 synced.append(
                     upsert_chat(
                         chat_id=f"{src_tag}_{cid_hash}",
-                        title=title_clean[:80] or "Google AI Activity",
-                        messages=[
-                            {"role": "user", "content": title_clean or card["title"]},
-                            {"role": "assistant", "content": card["body"] or "(Activity entry)"},
-                        ],
+                        title=(prompt_full[:80] or "Google AI Activity"),
+                        messages=msgs,
                         source=src_tag,
-                        url=url,
+                        url=entry_url,
+                        created_at=iso_ts,
+                        updated_at=iso_ts,
                         base_dir=base_dir,
+                        source_chat_id=source_chat_id,
                     )
                 )
         except Exception as exc:
             synced.append({"url": url, "error": str(exc)})
+    _log_progress(
+        f"[myactivity] Completed: {len([r for r in synced if 'markdown_path' in r])} synced."
+    )
     return synced
 
 
@@ -1157,22 +1985,91 @@ async def sync_from_browser(
             }
 
         synced_results: list[dict[str, Any]] = []
+        surfaces: dict[str, dict[str, Any]] = {}
+
+        def _record_surface(name: str, items: list[dict[str, Any]]) -> None:
+            synced_results.extend(items)
+            errs = [
+                {k: v for k, v in r.items() if k in ("chat_id", "url", "error")}
+                for r in items
+                if "error" in r
+            ]
+            unique_ok = {r["chat_id"] for r in items if "markdown_path" in r and r.get("chat_id")}
+            surfaces[name] = {
+                "synced_count": len(unique_ok),
+                "error_count": len(errs),
+                "errors": errs[:20],
+            }
+
         if target in ("gemini", "all"):
-            synced_results.extend(await _sync_gemini_app_page(page, max_chats, base_dir))
+            _record_surface("gemini", await _sync_gemini_app_page(page, max_chats, base_dir))
         if target in ("aimode", "all"):
-            synced_results.extend(await _sync_search_ai_mode_page(page, max_chats, base_dir))
+            _record_surface("aimode", await _sync_search_ai_mode_page(page, max_chats, base_dir))
         if target in ("aistudio", "all"):
-            synced_results.extend(await _sync_aistudio_page(page, max_chats, base_dir))
+            _record_surface("aistudio", await _sync_aistudio_page(page, max_chats, base_dir))
         if target in ("notebooklm", "all"):
-            synced_results.extend(await _sync_notebooklm_page(page, max_chats, base_dir))
+            _record_surface("notebooklm", await _sync_notebooklm_page(page, max_chats, base_dir))
         if target in ("myactivity", "all"):
-            synced_results.extend(await _sync_myactivity_page(page, max_chats, base_dir))
+            ma_items = await _sync_myactivity_page(page, max_chats, base_dir)
+            _record_surface("myactivity", ma_items)
+            if target == "all":
+                known_gem_ids = {
+                    r.get("chat_id")
+                    for r in synced_results
+                    if "markdown_path" in r and r.get("chat_id")
+                }
+                discovered_gemini: list[dict[str, str]] = []
+                seen_disc: set[str] = set()
+                for item in ma_items:
+                    scid = item.get("source_chat_id")
+                    if (
+                        scid
+                        and not str(scid).startswith("aimode_")
+                        and scid not in known_gem_ids
+                        and scid not in seen_disc
+                    ):
+                        seen_disc.add(scid)
+                        discovered_gemini.append(
+                            {
+                                "id": str(scid),
+                                "url": f"https://gemini.google.com/app/{scid}",
+                                "title": str(item.get("title") or ""),
+                            }
+                        )
+                remaining = max(0, max_chats - len(known_gem_ids))
+                if discovered_gemini and remaining > 0:
+                    _log_progress(
+                        f"[gemini] Backfilling {min(len(discovered_gemini), remaining)} "
+                        f"thread(s) discovered via My Activity..."
+                    )
+                    extra_res = await _sync_gemini_app_page(
+                        page,
+                        remaining,
+                        base_dir,
+                        extra_chats=discovered_gemini,
+                    )
+                    _record_surface("gemini_from_myactivity", extra_res)
+
+        deduped_chats: list[dict[str, Any]] = []
+        seen_result_idx: dict[str, int] = {}
+        for r in synced_results:
+            cid = r.get("chat_id")
+            if cid and "markdown_path" in r:
+                cid_str = str(cid)
+                if cid_str in seen_result_idx:
+                    deduped_chats[seen_result_idx[cid_str]] = r
+                else:
+                    seen_result_idx[cid_str] = len(deduped_chats)
+                    deduped_chats.append(r)
+            else:
+                deduped_chats.append(r)
 
         return {
             "status": "ok",
             "target": target,
-            "synced_count": len([r for r in synced_results if "markdown_path" in r]),
-            "synced_chats": synced_results,
+            "synced_count": len([r for r in deduped_chats if "markdown_path" in r]),
+            "surfaces": surfaces,
+            "synced_chats": deduped_chats,
         }
 
 
@@ -1199,7 +2096,11 @@ def _detect_url_surface_and_id(url: str) -> tuple[str, str]:
         return ("browser_notebooklm", f"notebooklm_{m_nb.group(1)}")
 
     if "udm=50" in u or "aimode" in u:
-        cid = hashlib.sha1(u.encode()).hexdigest()[:14]
+        canon = _canonicalize_aimode_url(u)
+        m_mtid = re.search(r"[?&]mtid=([a-zA-Z0-9_-]+)", canon)
+        if m_mtid:
+            return ("browser_search_ai_mode", f"aimode_{m_mtid.group(1)}")
+        cid = hashlib.sha1(canon.encode()).hexdigest()[:14]
         return ("browser_search_ai_mode", f"aimode_{cid}")
 
     cid = hashlib.sha1(u.encode()).hexdigest()[:14]
@@ -1346,6 +2247,74 @@ def _probe_profile_google_cookies(profile_dir: Path) -> int:
         return 0
 
 
+def _check_registered_mcp_configs(
+    config_paths: list[Path] | None = None,
+) -> list[dict[str, Any]]:
+    """Inspects standard MCP client config files and verifies command and --directory paths."""
+    home = Path.home()
+    candidates = config_paths or [
+        home / ".gemini" / "config" / "mcp_config.json",
+        home / ".gemini" / "antigravity" / "mcp_config.json",
+        home / ".cursor" / "mcp.json",
+        home / ".claude.json",
+    ]
+    results: list[dict[str, Any]] = []
+    for cfg_path in candidates:
+        if not cfg_path.is_file():
+            continue
+        entry_info: dict[str, Any] = {
+            "path": str(cfg_path),
+            "configured": False,
+            "ok": True,
+            "issues": [],
+        }
+        try:
+            raw = json.loads(cfg_path.read_text(encoding="utf-8", errors="replace"))
+        except Exception as exc:
+            entry_info["ok"] = False
+            entry_info["issues"].append(f"Failed to parse JSON: {exc}")
+            results.append(entry_info)
+            continue
+
+        servers = raw.get("mcpServers") if isinstance(raw, dict) else None
+        srv = servers.get("google-ai-history") if isinstance(servers, dict) else None
+        if not isinstance(srv, dict):
+            results.append(entry_info)
+            continue
+
+        entry_info["configured"] = True
+        cmd = str(srv.get("command") or "").strip()
+        args = [str(a) for a in (srv.get("args") or [])]
+        entry_info["command"] = cmd
+        entry_info["args"] = args
+
+        if not cmd:
+            entry_info["ok"] = False
+            entry_info["issues"].append("Missing 'command' field.")
+        elif "/" in cmd or "\\" in cmd or cmd.lower().endswith(".exe"):
+            if not Path(cmd).is_file():
+                entry_info["ok"] = False
+                entry_info["issues"].append(f"Command path does not exist: {cmd}")
+        elif shutil.which(cmd) is None:
+            entry_info["ok"] = False
+            entry_info["issues"].append(f"Command '{cmd}' was not found on PATH.")
+
+        if "--directory" in args:
+            dir_idx = args.index("--directory")
+            if dir_idx + 1 >= len(args):
+                entry_info["ok"] = False
+                entry_info["issues"].append("'--directory' flag has no value.")
+            else:
+                dir_val = args[dir_idx + 1]
+                entry_info["directory"] = dir_val
+                if not Path(dir_val).is_dir():
+                    entry_info["ok"] = False
+                    entry_info["issues"].append(f"--directory path does not exist: {dir_val}")
+
+        results.append(entry_info)
+    return results
+
+
 def check_system_health(
     base_dir: Path | str | None = None,
     cdp_url: str = "http://127.0.0.1:9222",
@@ -1375,6 +2344,8 @@ def check_system_health(
     profile_initialized = (profile_dir / "Default").is_dir()
     google_auth_cookie_count = _probe_profile_google_cookies(profile_dir)
     auth_ready = bool(chrome_exe and google_auth_cookie_count > 0)
+    mcp_configs = _check_registered_mcp_configs()
+    mcp_configs_ok = all(c.get("ok", True) for c in mcp_configs)
 
     recommendations: list[str] = []
     if not all(deps.values()):
@@ -1392,9 +2363,13 @@ def check_system_health(
             "No Google auth session found in chrome_profile. Run 'google-ai-history setup' "
             "to open Chrome and sign into Google once for private chats."
         )
+    for cfg in mcp_configs:
+        if not cfg.get("ok", True):
+            for issue in cfg.get("issues", []):
+                recommendations.append(f"MCP config issue in {cfg['path']}: {issue}")
 
     return {
-        "status": "ok" if (py_ok and all(deps.values())) else "warning",
+        "status": "ok" if (py_ok and all(deps.values()) and mcp_configs_ok) else "warning",
         "python_version": py_ver,
         "python_supported": py_ok,
         "dependencies": deps,
@@ -1405,6 +2380,8 @@ def check_system_health(
         "google_auth_cookie_count": google_auth_cookie_count,
         "public_share_links_ready": True,
         "authenticated_surfaces_ready": auth_ready,
+        "mcp_configs_ok": mcp_configs_ok,
+        "mcp_configs": mcp_configs,
         "recommendations": recommendations,
     }
 
@@ -1591,115 +2568,118 @@ async def fetch_chat_from_url(
                 break
             await asyncio.sleep(1.0)
 
-        # Harvest full virtualised transcript across infinite-scroller.chat-history windows
-        harvested = (
-            await _harvest_gemini_turns_from_page(page) if source_tag == "browser_gemini" else []
-        )
+        incomplete: str | None = None
+        attachments: list[dict[str, Any]] = []
+        created_at: str | None = None
+        stored_url = clean_url
 
-        extracted = (
-            await page.evaluate(
-                """() => {
-                const messages = [];
-                // 1. Gemini App / Share turns
-                const geminiNodes = document.querySelectorAll(
-                    'user-query, model-response, share-turn-viewer response-container, ' +
-                    '[data-message-author-role]'
-                );
-                if (geminiNodes.length > 0) {
-                    geminiNodes.forEach(node => {
-                        const tag = node.tagName.toLowerCase();
-                        const roleAttr = node.getAttribute('data-message-author-role');
-                        if (tag === 'user-query' || roleAttr === 'user') {
-                            const qEl = node.querySelector(
-                                '.query-text, .user-query-text'
-                            ) || node;
-                            const txt = (qEl.innerText || '')
-                                .replace(/^You said[^\\n]*\\n+/i, '')
-                                .replace(/^You said\\s*/i, '')
-                                .trim();
-                            if (txt) messages.push({ role: 'user', content: txt });
-                        } else if (
-                            tag === 'model-response' ||
-                            tag === 'response-container' ||
-                            roleAttr === 'model'
-                        ) {
-                            const md = node.querySelector(
-                                'message-content, .markdown, .model-response-text'
-                            ) || node;
-                            const txt = (md.innerText || '')
-                                .replace(/^Gemini said\\s*/i, '')
-                                .trim();
-                            if (txt) messages.push({ role: 'assistant', content: txt });
-                        }
-                    });
-                }
-
-                // 2. AI Studio turns
-                if (messages.length === 0) {
-                    const studioTurns = document.querySelectorAll(
-                        'ms-chat-turn, .chat-turn, [data-turn-role]'
+        if source_tag == "browser_gemini":
+            gem_parsed = await _extract_gemini_chat_from_page(page)
+            msgs = gem_parsed["messages"]
+            title = gem_parsed["title"]
+            incomplete = gem_parsed.get("incomplete")
+            created_at = gem_parsed.get("created_at")
+        elif source_tag == "browser_aistudio":
+            ais_parsed = await _extract_aistudio_from_page(page)
+            msgs = ais_parsed["messages"]
+            title = ais_parsed["title"]
+            attachments = ais_parsed.get("attachments") or []
+        else:
+            if source_tag == "browser_search_ai_mode":
+                stored_url = _canonicalize_aimode_url(clean_url)
+            extracted = (
+                await page.evaluate(
+                    """() => {
+                    const messages = [];
+                    // 1. Gemini Share turns
+                    const geminiNodes = document.querySelectorAll(
+                        'user-query, model-response, share-turn-viewer response-container, ' +
+                        '[data-message-author-role]'
                     );
-                    studioTurns.forEach(el => {
-                        const roleAttr = (
-                            el.getAttribute('data-turn-role') || el.className || ''
-                        ).toLowerCase();
-                        const role = roleAttr.includes('user') ? 'user' : 'assistant';
-                        const txt = (el.innerText || '').trim();
-                        if (txt) messages.push({ role, content: txt });
-                    });
-                }
+                    if (geminiNodes.length > 0) {
+                        geminiNodes.forEach(node => {
+                            const tag = node.tagName.toLowerCase();
+                            const roleAttr = node.getAttribute('data-message-author-role');
+                            if (tag === 'user-query' || roleAttr === 'user') {
+                                const qEl = node.querySelector(
+                                    '.query-text, .user-query-text'
+                                ) || node;
+                                const txt = (qEl.innerText || '')
+                                    .replace(/^You said[^\\n]*\\n+/i, '')
+                                    .replace(/^You said\\s*/i, '')
+                                    .trim();
+                                if (txt) messages.push({ role: 'user', content: txt });
+                            } else if (
+                                tag === 'model-response' ||
+                                tag === 'response-container' ||
+                                roleAttr === 'model'
+                            ) {
+                                const md = node.querySelector(
+                                    'message-content, .markdown, .model-response-text'
+                                ) || node;
+                                const txt = (md.innerText || '')
+                                    .replace(/^Gemini said\\s*/i, '')
+                                    .trim();
+                                if (txt) messages.push({ role: 'assistant', content: txt });
+                            }
+                        });
+                    }
 
-                // 3. Search AI Mode (udm=50) multi-turn extraction
-                if (messages.length === 0) {
-                    const mainEl = document.querySelector('main, [role="main"]') || document.body;
-                    let text = (mainEl?.innerText || '').trim();
-                    const marker = 'AI Mode Conversation:';
-                    const idx = text.indexOf(marker);
-                    if (idx !== -1) {
-                        text = text.slice(idx).trim();
-                        const pattern = new RegExp(
-                            'You said:\\\\s*([^\\\\n]+)\\\\n(?:[^\\\\n]*\\\\n){0,4}?' +
-                            'AI Mode reply for [^\\\\n]+\\\\n([\\\\s\\\\S]*?)' +
-                            '(?=\\\\nYou said:|\\\\nSkip to previous prompt|\\\\nAI Mode reply|$)',
-                            'g'
-                        );
-                        let match;
-                        while ((match = pattern.exec(text)) !== null) {
-                            const p = (match[1] || '').trim();
-                            let r = (match[2] || '').trim().replace(/\\nShow all\\s*$/, '').trim();
-                            if (p) messages.push({ role: 'user', content: p });
-                            if (r) messages.push({ role: 'assistant', content: r });
+                    // 2. Search AI Mode (udm=50) multi-turn extraction
+                    if (messages.length === 0) {
+                        const mainEl =
+                            document.querySelector('main, [role="main"]') || document.body;
+                        let text = (mainEl?.innerText || '').trim();
+                        const marker = 'AI Mode Conversation:';
+                        const idx = text.indexOf(marker);
+                        if (idx !== -1) {
+                            text = text.slice(idx).trim();
+                            const pattern = new RegExp(
+                                'You said:\\\\s*([^\\\\n]+)\\\\n(?:[^\\\\n]*\\\\n){0,4}?' +
+                                'AI Mode reply for [^\\\\n]+\\\\n([\\\\s\\\\S]*?)' +
+                                '(?=\\\\nYou said:|\\\\nSkip to previous prompt|' +
+                                '\\\\nAI Mode reply|$)',
+                                'g'
+                            );
+                            let match;
+                            while ((match = pattern.exec(text)) !== null) {
+                                const p = (match[1] || '').trim();
+                                let r = (match[2] || '').trim()
+                                    .replace(/\\nShow all\\s*$/, '').trim();
+                                if (p) messages.push({ role: 'user', content: p });
+                                if (r) messages.push({ role: 'assistant', content: r });
+                            }
                         }
                     }
-                }
 
-                // 4. Fallback for NotebookLM or generic Google AI page
-                if (messages.length === 0) {
-                    const mainEl = document.querySelector('main') || document.body;
-                    const txt = (mainEl?.innerText || '').trim();
-                    if (txt) messages.push({ role: 'assistant', content: txt });
-                }
+                    // 3. Fallback for NotebookLM or generic Google AI page
+                    if (messages.length === 0) {
+                        const mainEl = document.querySelector('main') || document.body;
+                        const txt = (mainEl?.innerText || '').trim();
+                        if (txt) messages.push({ role: 'assistant', content: txt });
+                    }
 
-                const titleEl = document.querySelector(
-                    '[data-test-id="conversation-title"], .conversation-title, h1'
-                );
-                let pageTitle = (titleEl?.innerText || document.title || '')
-                    .replace(/^Gemini\\s*[-??]\\s*/i, '')
-                    .trim();
-                const mAiTitle = pageTitle.match(/AI Mode Conversation:\\s*([^\\n]+)/i);
-                if (mAiTitle) {
-                    pageTitle = mAiTitle[1].trim();
-                } else if (/^(Google Gemini|Conversation with Gemini|Gemini)$/i.test(pageTitle)) {
-                    pageTitle = messages[0]?.content?.split('\\n')[0]?.slice(0, 80) || '';
-                }
-                return { pageTitle: pageTitle || 'Google AI Session', messages };
-            }"""
+                    const titleEl = document.querySelector(
+                        '[data-test-id="conversation-title"], ' +
+                        '.conversation-title:not(.picker-secondary-text), h1'
+                    );
+                    let pageTitle = (titleEl?.innerText || document.title || '').trim();
+                    const mAiTitle = pageTitle.match(/AI Mode Conversation:\\s*([^\\n]+)/i);
+                    if (mAiTitle) {
+                        pageTitle = mAiTitle[1].trim();
+                    }
+                    return { pageTitle: pageTitle || document.title || '', messages };
+                }"""
+                )
+                or {}
             )
-            or {}
-        )
-
-        msgs = harvested if harvested else (extracted.get("messages") or [])
-        title = _strip_directional_chars(extracted.get("pageTitle") or f"Google AI Chat {chat_id}")
+            msgs = extracted.get("messages") or []
+            raw_title = _clean_gemini_title(str(extracted.get("pageTitle") or ""))
+            if not raw_title and msgs:
+                raw_title = _strip_directional_chars(
+                    str(msgs[0].get("content") or "")
+                ).splitlines()[0][:80]
+            title = raw_title or f"Google AI Chat {chat_id}"
         if not msgs:
             final_url = str(getattr(page, "url", "") or "")
             if "CookieMismatch" in final_url:
@@ -1746,8 +2726,11 @@ async def fetch_chat_from_url(
             title=title[:100],
             messages=msgs,
             source=source_tag,
-            url=clean_url,
+            url=stored_url,
+            created_at=created_at,
             base_dir=base_dir,
+            incomplete=incomplete,
+            attachments=attachments or None,
         )
         full_record = get_chat(chat_id, base_dir=base_dir)
         return {

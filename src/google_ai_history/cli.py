@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import sys
+from pathlib import Path
 
 from google_ai_history.db import list_chats, search_chats
 from google_ai_history.importers import (
@@ -106,6 +107,11 @@ def main() -> None:
         res = list_chats(source=args.source)
         print(json.dumps(res, indent=2))
     else:
+        print(
+            f"[google-ai-history] Starting MCP server from {Path(__file__).resolve()}",
+            file=sys.stderr,
+            flush=True,
+        )
         mcp.run()
 
 
